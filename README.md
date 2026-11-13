@@ -1,0 +1,173 @@
+# supermimic_hoi
+
+Whole-body human-object interaction for the **Unitree G1 (29 DoF) with two Inspire hands**, trained
+with a learned coupled robot/object world model and differentiable actor rollouts. The method is
+the BlinkMimic HOI design; the robot, objects and reference motions are
+[Weave](https://xiaohu-art.github.io/Weave/)'s.
+
+- **41 actions at 50 Hz.** 29 body joints are residuals on the next reference pose. 12 finger
+  drivers are absolute commands in [-1, 1], mapped onto their joint limits and low-pass filtered.
+  The 12 Inspire mimic joints follow their driver's target through their own PD drive.
+- **Dynamic objects.** Objects move only through contact: no virtual spring, support wrench or
+  reference force. Physics is MuJoCo-Warp through mjlab, four 5 ms steps per control step.
+- **Coupled world model.** One MLP predicts robot and object increments, conditioned on a one-hot
+  object key and the physical context. Imagination uses tensor kinematics and analytic rewards
+  only; it never queries contact geometry.
+- **Learned contact reward.** A separate small head predicts ten per-finger force scores from
+  measured simulator contact; actor updates differentiate through its frozen weights.
+- **Actor and critic.** A deterministic actor (motion encoder + history decoder) maximizes a
+  32-step imagined return with a bounded bootstrap from a target critic; the critic regresses
+  lambda-returns of the same rollouts.
+- **One fast path.** Fixed-shape collection and all four learners run as `torch.compile`d
+  functions inside CUDA graphs. The learning graphs share one scratch memory pool.
+
+## Layout
+
+| Module | Role |
+|---|---|
+| `robot.py`, `kinematics.py`, `rotations.py` | G1 + Inspire description, torch FK built from the MJCF, rotation utilities |
+| `motion.py` | Reference library: clips, finite-difference velocities, FK of tracked bodies, goals |
+| `control.py` | Actions to PD targets (reference skip, finger filter, mimic joints) |
+| `mdp.py` | Observation, reward and termination, shared by simulation and imagination |
+| `sim.py`, `contacts.py`, `variant_collision.py` | CPU and MuJoCo-Warp physics, physics guard, hand-object contact forces |
+| `randomization.py`, `reset_guard.py`, `env.py` | Domain randomization and context, penetration screen for resets, the vector environment |
+| `networks.py`, `optim.py`, `learning.py` | World model, contact head, actor, critic; Muon+Adam; returns and the gated update |
+| `buffer.py`, `cuda_graph.py`, `runner.py` | Replay, CUDA-graph capture, the training loop |
+| `prepare/`, `audit.py`, `evaluate.py`, `render.py`, `train.py` | Command-line tools |
+
+## Setup
+
+Python 3.12 and a CUDA GPU. Versions are pinned in `uv.lock` (torch 2.9.0 cu128, mujoco and
+mujoco-warp 3.11.0, mjlab 1.6.0, warp 1.16.0).
+
+```bash
+uv sync --all-extras
+```
+
+Assets and references are generated from a Weave checkout that has its test reference archives
+in `data/test/` (see Weave's README; the archives come from `appolyn/Weave` on Hugging Face):
+
+```bash
+uv run python -m supermimic_hoi.prepare --weave /path/to/Weave
+```
+
+This writes `data/` (git-ignored, about 70 MB):
+
+- `data/robot/`: `g1_inspire.xml`, compiled from Weave's URDF. Every link is a body, the pelvis
+  is free, and collision geometry is the link's convex hull capped at 32 vertices (foot and
+  shoulder cylinders become capsules, as in Weave's import). Self-collision is disabled, as in Weave.
+- `data/objects/`: one MJCF per object with CoACD convex parts (at most 32, each capped at 32
+  vertices) and an explicit inertial. Mass is Weave's density (200 kg/m^3, large box 25) times the
+  volume of the convex parts; friction is 0.8.
+- `data/weave600/`: 600 clips (1.37 h at 50 Hz) sampled from Weave's test split with seed 0,
+  66 or 67 per object over nine objects, covering all 321 base interactions before taking a second
+  approach variant of any. Stored per frame: pelvis pose, 53 joint positions, object pose and Weave's
+  per-body contact labels. `manifest.json` lists the clips and the source checksums.
+
+Preparation checks that torch FK on the converted model reproduces Weave's recorded body positions
+(largest difference 0.002 mm), which validates the joint order and the URDF conversion. Four
+candidate clips whose knee reference wraps through pi are rejected as corrupted and listed in the
+manifest.
+
+## Use
+
+```bash
+uv run pytest                                                   # CPU tests
+uv run python -m supermimic_hoi.audit --config configs/weave600.json
+uv run python -m supermimic_hoi.train --config configs/weave600.json
+uv run python -m supermimic_hoi.evaluate logs/weave600/last.pt --record sub17_smallbox_034_v03
+uv run python -m supermimic_hoi.render --rollout results/evaluation_sub17_smallbox_034_v03.npz --output results/rollout.mp4
+uv run python -m supermimic_hoi.render --clip sub17_smallbox_034_v03 --output results/reference.mp4
+```
+
+`TrainConfig` in `config.py` is the single list of options; a JSON config and the command-line
+flags of `train` override its defaults. `configs/weave600.json` (600 worlds, batches of 1,024)
+fits a 16 GB GPU. `configs/weave600_large.json` (4,200 worlds, batches of 8,192) mirrors the
+allocation BlinkMimic HOI used on large GPUs and has not been run from this repository.
+
+Training writes `config.json`, `reset_guard.json`, `metrics.jsonl` and checkpoints to `log_dir`.
+`--resume` restores networks, normalizers, optimizers and counters; episodes and replay start
+fresh. A checkpoint is bound to the dataset, the reference processing and the physical assets.
+Both presets log to [SwanLab](https://swanlab.cn) (`swanlab_mode: online`, project `supermimic_hoi`,
+run named after the log directory). Run `uv run swanlab login` once; `--swanlab-mode offline` or
+`disabled` turns the upload off.
+
+The first run compiles the collection and learning functions, which takes several minutes;
+later runs reuse the compiler cache.
+
+## Design notes
+
+**References.** Robot and object share one world frame and are always reset together. Joint
+references are projected onto the joint limits before velocities and FK are derived. This changes
+25.7 % of frames: finger references beyond the URDF limits in 24.5 % (mostly the thumb mimic
+joints, by up to 0.35 rad) and body joints in 1.5 % (by up to 0.19 rad). Weave's per-body contact labels become ten per-finger intents: a finger is
+intended to touch while any of its links is labelled in contact.
+
+**Each world owns one clip.** `num_envs` is a multiple of the clip count, and replay sampling
+draws a clip uniformly before drawing one of its transitions, so clips whose episodes end early
+keep their weight.
+
+**Reset states.** Episodes start at the clip's first frame (25 %), ten frames before a sustained
+contact phase (25 %) or uniformly within the clip (50 %). Weave's references are kinematic and
+overlap the ground and the object: the deepest overlap exceeds 10 mm in 62 % of frames and reaches
+0.38 m (feet under the floor while crouching). Resetting MuJoCo into deep overlap launches bodies,
+so every proposed start is moved to the nearest frame of its clip that overlaps at most
+`reset_penetration_tolerance` (20 mm). At 20 mm, 53 % of frames are admissible, every clip keeps at
+least 51 of them, and 0.005 % of admissible resets terminate within five reference-PD steps; a 3 mm
+tolerance would leave 47 clips without any admissible frame. `audit` measures this on the training
+physics.
+
+**Rewards** (weights in `RewardConfig`, each scaled by the 0.02 s step): exponential tracking of
+the pelvis, 13 further bodies and the object (position, orientation, velocity); fingertip positions
+in the object frame for hands the reference has in contact; the contact score; and costs on the
+action rate (full normalized body command), soft joint limits, foot slip and finger command
+saturation. The contact score averages the force scores of each hand's intended fingers (0 below
+1 N, saturating at 5 N) and takes the worse of the required hands.
+
+**Termination:** pelvis position error above 0.25 m, tilt error above 0.8, object position error
+above 0.25 m or object rotation error above 45 degrees. Imagination uses a smooth surrogate of the
+same conditions and never rolls past the end of a clip. Contact is rewarded but is not a
+termination condition: neither the world model nor the critic carries a contact state, and
+`evaluate` reports contact coverage beside the completion rate.
+
+**Physics guard.** A world whose speeds leave generous numerical limits is restored to its last
+valid state inside the step, reported as an invalid transition and reset; it never reaches replay
+or normalizer statistics. Nonfinite states, nonfinite targets and exhausted contact or constraint
+capacity stop training. An invalid learner update (nonfinite, or a gradient norm above
+`max_gradient_norm`) is skipped entirely on the device and then stops training with a checkpoint.
+
+**Randomization.** Robot friction (0.3 to 1.2, once per world), torso centre of mass (once per
+world), encoder offsets (0.01 rad, per episode) and observation noise. The world model, contact
+head and critic see these parameters and the object's mass properties; the actor does not.
+
+### Differences from BlinkMimic HOI
+
+- Hands: 12 driver commands plus 12 software-coupled mimic joints, instead of 44 independent
+  finger joints.
+- Contact: every contact between a hand link and the object counts. There is no calibrated
+  inner-hand contact region for the Inspire hand.
+- Contact intent is per finger (from Weave's per-link labels) rather than per hand.
+- The world model predicts no hand-contact logits, and losing an intended contact does not end an
+  episode.
+- Reset tolerance is 20 mm instead of 3 mm, and there are no reset translation corrections or
+  scene support fixtures (Weave's scenes are ground plus object).
+- `max_episode_steps` is 1,000 (Weave's 20 s) so a clip of up to 639 frames can be completed
+  from its first frame.
+- Legacy recipes, alternative reward modes, adaptive sampling, settle tails, fine-tuning, replay
+  offload and the diagnostic tools were not carried over.
+
+## Validation
+
+Measured on one RTX 4080 (16 GB) with `configs/weave600.json`. These checks show that the pipeline
+runs and is numerically sound. They do not show that a policy learns the task: no long training
+run has been made yet.
+
+| Check | Result |
+|---|---|
+| `pytest` | 41 passed: 37 on CPU, 4 on the GPU (Warp against CPU physics, physics guard, training with all six CUDA graphs) |
+| Preparation | Torch FK reproduces Weave's recorded body positions within 0.002 mm on all 600 clips |
+| `audit` | 129,743 admissible reset frames restored within 2.4e-6 of the reference; over five reference-PD steps none was rejected numerically and 6 (0.005 %) terminated |
+| Training, 500 iterations | 0.241 s per iteration (12,400 simulator transitions per second), 8.8 GiB device memory, no rejected transition; compilation adds several minutes on the first run |
+| The same setup without compilation or graphs | 1.92 s per iteration |
+| Learning signals over those 500 iterations | world-model loss 7.2 to 0.44, mean episode length 32 to 88 steps, imagined survival 0.14 to 0.67 |
+| `evaluate` on that checkpoint | 0 of 600 clips completed, mean progress 0.44, contact on 28 % of intended hand-steps: the policy follows the approach and then loses the object, as expected after two minutes of training |

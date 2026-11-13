@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supermimic-hoi"
+version = "0.1.0"
+description = "Unitree G1 + Inspire hands human-object interaction with a coupled world model and differentiable actor rollouts."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "mjlab==1.6.0",
+  "mujoco==3.11.0",
+  "mujoco-warp==3.11.0",
+  "torch>=2.7.0",
+  "numpy",
+]
+
+[project.optional-dependencies]
+# Offline asset preparation (URDF conversion, convex decomposition).
+assets = ["coacd==1.0.14", "trimesh", "scipy"]
+# Side-by-side rollout videos.
+render = ["imageio-ffmpeg"]
+tracking = ["swanlab==0.10.3"]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv]
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+# CUDA 12.8 torch; pinned to the versions this code was validated with.
+constraint-dependencies = ["torch==2.9.0", "warp-lang==1.16.0"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }

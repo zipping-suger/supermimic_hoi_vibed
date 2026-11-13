@@ -1,0 +1,11 @@
+{
+  "dataset": "data/weave600",
+  "robot_assets": "data/robot",
+  "object_assets": "data/objects",
+  "num_envs": 600,
+  "wm_batch": 1024,
+  "pi_batch": 1024,
+  "iterations": 30000,
+  "log_dir": "logs/weave600",
+  "swanlab_mode": "online"
+}
