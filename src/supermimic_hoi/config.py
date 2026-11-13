@@ -21,10 +21,10 @@ class RewardConfig:
     body_angvel_std: float = 3.14
     root_pos: float = 1.0
     root_ori: float = 1.0
-    object_pos: float = 1.0
-    object_pos_std: float = 0.3
-    object_ori: float = 1.0
-    object_ori_std: float = 0.4
+    object_pos: float = 2.0
+    object_pos_std: float = 0.2
+    object_ori: float = 2.0
+    object_ori_std: float = 0.3
     object_velocity: float = 0.25
     # Fingertip positions in the object frame, for hands the reference has in contact.
     relative: float = 1.0
@@ -41,8 +41,8 @@ class RewardConfig:
     # Termination.
     term_root_pos: float = 0.25
     term_tilt: float = 0.8
-    term_object_pos: float = 0.25
-    term_object_angle: float = math.pi / 4
+    term_object_pos: float = 0.3
+    term_object_tilt: float = 0.3  # difference of the vertical component of the object's z axis
 
     BONUSES = ("body_pos", "body_ori", "body_velocity", "body_angular_velocity", "root_pos", "root_ori",
                "object_pos", "object_ori", "object_velocity", "relative", "contact")  # fmt: skip
@@ -86,7 +86,8 @@ class TrainConfig:
     # Episode starts: frame zero, shortly before a contact phase, otherwise uniform over the clip.
     reset_frame_zero_probability: float = 0.25
     reset_pregrasp_probability: float = 0.25
-    reset_penetration_tolerance: float = 0.02  # reference frames overlapping more than this are not reset states
+    # Deepest reference overlap [m] admitted in a reset state, per kind of collision pair.
+    reset_overlap_tolerance: dict[str, float] = field(default_factory=lambda: {"hand_object": 0.04, "robot_ground": 0.1, "other": 0.02})
 
     # Collection and replay.
     iterations: int = 30000
@@ -182,8 +183,9 @@ class TrainConfig:
         probabilities = (self.reset_frame_zero_probability, self.reset_pregrasp_probability)
         if any(not 0 <= p <= 1 for p in probabilities) or sum(probabilities) > 1:
             raise ValueError("Invalid reset mixture probabilities")
-        if not (math.isfinite(self.reset_penetration_tolerance) and self.reset_penetration_tolerance >= 0):
-            raise ValueError("reset_penetration_tolerance must be finite and nonnegative")
+        if set(self.reset_overlap_tolerance) != {"hand_object", "robot_ground", "other"} or any(
+                not (math.isfinite(v) and v >= 0) for v in self.reset_overlap_tolerance.values()):  # fmt: skip
+            raise ValueError("reset_overlap_tolerance needs finite nonnegative hand_object, robot_ground and other depths")
         if self.buffer_steps < self.wm_window or self.warmup_steps < self.wm_window:
             raise ValueError("Replay and warmup must cover wm_window")
         if (self.pi_batch * self.horizon) % self.critic_minibatches:

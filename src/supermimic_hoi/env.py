@@ -38,7 +38,7 @@ class HOIEnv:
         self.physics = backend(robot, registry, cfg.object_assets, assignment, cfg)
         self.randomizer = Randomizer(robot, self.physics, mdp.layout, cfg.randomize)
         self.reset_map, self.reset_depths, self.reset_summary = build_reset_guard(
-            motion, robot, registry, cfg.object_assets, cfg.reset_penetration_tolerance)
+            motion, robot, registry, cfg.object_assets, cfg.reset_overlap_tolerance)
         self.pregrasp, self.pregrasp_count = motion.pregrasp_frames()
 
         N, dev = self.N, self.device

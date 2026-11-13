@@ -111,10 +111,14 @@ keep their weight.
 contact phase (25 %) or uniformly within the clip (50 %). Weave's references are kinematic and
 overlap the ground and the object: the deepest overlap exceeds 10 mm in 62 % of frames and reaches
 0.38 m (feet under the floor while crouching). Resetting MuJoCo into deep overlap launches bodies,
-so every proposed start is moved to the nearest frame of its clip that overlaps at most
-`reset_penetration_tolerance` (20 mm). At 20 mm, 53 % of frames are admissible, every clip keeps at
-least 51 of them, and 0.005 % of admissible resets terminate within five reference-PD steps; a 3 mm
-tolerance would leave 47 clips without any admissible frame. `audit` measures this on the training
+so every proposed start is moved to the nearest frame of its clip whose overlaps are within
+`reset_overlap_tolerance`. How deep is harmless depends on the pair, so there is one tolerance per
+kind: 40 mm between a hand and the object (the references grasp with the fingers a median 24 mm
+inside it, and a finger is pushed out against a 1 Nm drive), 100 mm between the robot and the
+ground, and 20 mm for everything else (body against object, object against ground). This admits
+89 % of all frames and 81 % of the frames in which the reference touches the object, at least 181
+per clip. A single 20 mm tolerance admitted only 17 % of the contact frames, so episodes almost
+never started with the object in hand. `audit` measures the admitted resets on the training
 physics.
 
 **Rewards** (weights in `RewardConfig`, each scaled by the 0.02 s step): exponential tracking of
@@ -124,11 +128,13 @@ action rate (full normalized body command), soft joint limits, foot slip and fin
 saturation. The contact score averages the force scores of each hand's intended fingers (0 below
 1 N, saturating at 5 N) and takes the worse of the required hands.
 
-**Termination:** pelvis position error above 0.25 m, tilt error above 0.8, object position error
-above 0.25 m or object rotation error above 45 degrees. Imagination uses a smooth surrogate of the
-same conditions and never rolls past the end of a clip. Contact is rewarded but is not a
-termination condition: neither the world model nor the critic carries a contact state, and
-`evaluate` reports contact coverage beside the completion rate.
+**Termination** (Weave's thresholds): pelvis position error above 0.25 m, pelvis tilt error above
+0.8, object position error above 0.3 m or object tilt error above 0.3. Tilt is the difference of
+the vertical component of the body's z axis, so a yaw error never ends an episode; it is penalized
+by the orientation rewards. Imagination uses a smooth surrogate of the same conditions and never
+rolls past the end of a clip. Contact is rewarded but is not a termination condition: neither the
+world model nor the critic carries a contact state, and `evaluate` reports contact coverage beside
+the completion rate.
 
 **Physics guard.** A world whose speeds leave generous numerical limits is restored to its last
 valid state inside the step, reported as an invalid transition and reset; it never reaches replay
@@ -149,8 +155,11 @@ head and critic see these parameters and the object's mass properties; the actor
 - Contact intent is per finger (from Weave's per-link labels) rather than per hand.
 - The world model predicts no hand-contact logits, and losing an intended contact does not end an
   episode.
-- Reset tolerance is 20 mm instead of 3 mm, and there are no reset translation corrections or
+- Reset states are screened per kind of collision pair (40 mm hand-object, 100 mm robot-ground,
+  20 mm otherwise) instead of one 3 mm tolerance, and there are no reset translation corrections or
   scene support fixtures (Weave's scenes are ground plus object).
+- Object tracking uses Weave's training weights (2.0, with scales of 0.2 m and 0.3 rad) and Weave's
+  object termination (0.3 m, tilt 0.3).
 - `max_episode_steps` is 1,000 (Weave's 20 s) so a clip of up to 639 frames can be completed
   from its first frame.
 - Legacy recipes, alternative reward modes, adaptive sampling, settle tails, fine-tuning, replay

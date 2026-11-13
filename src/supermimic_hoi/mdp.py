@@ -14,7 +14,7 @@ from . import robot as R
 from .motion import CONTROL_DT
 from .rotations import angle_squared, mat_to_6d, mm3, mv3, yaw_mat
 
-FAILURE_REASONS = ("root_position", "root_tilt", "object_position", "object_rotation")
+FAILURE_REASONS = ("root_position", "root_tilt", "object_position", "object_tilt")
 
 
 def chain_product(value, dim):
@@ -61,8 +61,8 @@ class HOIMDP:
         self.noise = torch.cat((
             torch.full((J,), R.NOISE_JOINT_POS), torch.full((J,), R.NOISE_JOINT_VEL), torch.full((3,), R.NOISE_ANG_VEL),
             torch.full((3,), R.NOISE_GRAVITY), torch.zeros(A), torch.full((6,), R.NOISE_REF_ORI))).to(device)  # fmt: skip
-        self.thresholds = torch.tensor([cfg.term_root_pos, cfg.term_tilt, cfg.term_object_pos, cfg.term_object_angle], device=device)
-        self.temperatures = torch.tensor([0.02, 0.04, 0.02, 0.05], device=device)
+        self.thresholds = torch.tensor([cfg.term_root_pos, cfg.term_tilt, cfg.term_object_pos, cfg.term_object_tilt], device=device)
+        self.temperatures = torch.tensor([0.02, 0.04, 0.02, 0.04], device=device)
         self.max_step_reward = CONTROL_DT * sum(getattr(cfg, name) for name in cfg.BONUSES)
 
     def fk(self, s):
@@ -160,7 +160,7 @@ class HOIMDP:
         m = self.motion
         return torch.stack((
             (s[0] - m.root_p[f]).square().sum(-1).add(1e-12).sqrt(), (s[1][..., 2, 2] - m.root_R[f][..., 2, 2]).abs(),
-            (s[6] - m.object_p[f]).square().sum(-1).add(1e-12).sqrt(), angle_squared(s[7], m.object_R[f]).sqrt()), -1)  # fmt: skip
+            (s[6] - m.object_p[f]).square().sum(-1).add(1e-12).sqrt(), (s[7][..., 2, 2] - m.object_R[f][..., 2, 2]).abs()), -1)  # fmt: skip
 
     def hard_termination(self, s, f):
         """(failed, reasons) in simulation; reasons follow FAILURE_REASONS."""

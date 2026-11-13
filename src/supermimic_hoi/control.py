@@ -28,7 +28,8 @@ class Controller(nn.Module):
         self.register_buffer("center", value(robot.control_center))
         self.register_buffer("scale", value(robot.control_scale))
         self.num_body, self.num_hand = len(robot.body_idx), len(robot.driver_idx)
-        # 60 Hz filter constant of Weave's hand action, expressed at the control rate.
+        # First-order low-pass on the finger targets (0.9 per 1/60 s, expressed at the control rate).
+        # Weave applies finger targets unfiltered; the filter keeps exploration noise off the fingers.
         self.alpha = 1 - 0.9 ** (60 * dt)
         self.body_action_clip = body_action_clip
 
