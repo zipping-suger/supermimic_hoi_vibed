@@ -173,10 +173,10 @@ run has been made yet.
 
 | Check | Result |
 |---|---|
-| `pytest` | 41 passed: 37 on CPU, 4 on the GPU (Warp against CPU physics, physics guard, training with all six CUDA graphs) |
+| `pytest` | 42 passed: 38 on CPU, 4 on the GPU (Warp against CPU physics, physics guard, training with all six CUDA graphs) |
 | Preparation | Torch FK reproduces Weave's recorded body positions within 0.002 mm on all 600 clips |
-| `audit` | 129,743 admissible reset frames restored within 2.4e-6 of the reference; over five reference-PD steps none was rejected numerically and 6 (0.005 %) terminated |
-| Training, 500 iterations | 0.241 s per iteration (12,400 simulator transitions per second), 8.8 GiB device memory, no rejected transition; compilation adds several minutes on the first run |
+| `audit --steps 10` | 220,797 admissible reset frames restored within 4.8e-6 of the reference; over ten reference-PD steps none was rejected numerically and 2,423 (1.1 %) terminated on the object's position or tilt. Open-loop PD does not hold a carried object: 2.3 % of contact-phase resets without any hand-object overlap terminate, and 3.2 % of those 30 to 40 mm deep |
+| Training, 500 iterations | 0.242 s per iteration (12,400 simulator transitions per second), 8.8 GiB device memory, no rejected transition; compilation adds several minutes on the first run |
 | The same setup without compilation or graphs | 1.92 s per iteration |
-| Learning signals over those 500 iterations | world-model loss 7.2 to 0.44, mean episode length 32 to 88 steps, imagined survival 0.14 to 0.67 |
-| `evaluate` on that checkpoint | 0 of 600 clips completed, mean progress 0.44, contact on 28 % of intended hand-steps: the policy follows the approach and then loses the object, as expected after two minutes of training |
+| Learning signals over those 500 iterations | world-model loss 7.6 to 0.55, mean episode length 32 to 92 steps, imagined survival 0.14 to 0.67 |
+| `evaluate` on that checkpoint | 0 of 600 clips completed, mean progress 0.44, contact on 20 % of intended hand-steps: the policy follows the approach and then loses the object, as expected after two minutes of training |
