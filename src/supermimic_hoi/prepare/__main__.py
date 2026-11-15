@@ -1,4 +1,4 @@
-"""Build ``data/`` from a Weave checkout: robot MJCF, object collision assets, reference clips.
+"""Build ``data/`` from a Weave checkout: robot MJCF, object collision assets, sampled clips.
 
     python -m supermimic_hoi.prepare --weave /path/to/Weave
 """
@@ -16,7 +16,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--weave", required=True, type=Path, help="Weave checkout with data/<split>/*.npz downloaded")
     p.add_argument("--output", type=Path, default=Path("data"))
-    p.add_argument("--split", default="test", help="Weave reference split to sample from")
+    p.add_argument("--split", default="test", help="Folder under the checkout's data/: test (references) or rollout/test")
     p.add_argument("--clips", type=int, default=600)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--name", help="Dataset directory name (default: weave<clips>)")

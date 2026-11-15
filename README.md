@@ -74,6 +74,14 @@ Preparation checks that torch FK on the converted model reproduces Weave's recor
 candidate clips whose knee reference wraps through pi are rejected as corrupted and listed in the
 manifest.
 
+**Rollouts as references.** Weave also publishes the trajectories its policy executed in simulation
+for 1,541 of the 1,605 test clips (`rollout/test/` of the same Hugging Face dataset). With those
+archives in the checkout's `data/rollout/test/`, `prepare --split rollout/test` samples from them
+instead. The kinematic references overlap the object and the ground: in contact frames the hand is
+a median 22 mm inside the object, and the feet reach 0.38 m under the floor. The rollouts were
+simulated on the same collision shapes and overlap them by a median 1 mm. Their contact labels are
+measured contact (above 1 N), so a finger's contact intent is the contact Weave's policy made.
+
 ## Use
 
 ```bash
@@ -180,7 +188,7 @@ run has been made yet.
 
 | Check | Result |
 |---|---|
-| `pytest` | 44 passed: 40 on CPU, 4 on the GPU (Warp against CPU physics, physics guard, training with all six CUDA graphs) |
+| `pytest` | 45 passed: 41 on CPU, 4 on the GPU (Warp against CPU physics, physics guard, training with all six CUDA graphs) |
 | Preparation | Torch FK reproduces Weave's recorded body positions within 0.002 mm on all 600 clips |
 | `audit --steps 10` | 221,287 admissible reset frames restored within 4.8e-6 of the reference; over ten reference-PD steps none was rejected numerically and 2,698 (1.2 %) terminated, all but 16 on the object's position or tilt. Open-loop PD does not hold a carried object: 2.2 % of contact-phase resets without any hand-object overlap terminate, and 4.5 % of those 30 to 40 mm deep |
 | Training, 500 iterations | 0.237 s per iteration (12,600 simulator transitions per second), 8.7 GiB device memory, no rejected transition; compilation adds several minutes on the first run |

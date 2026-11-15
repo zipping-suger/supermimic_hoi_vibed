@@ -1,4 +1,9 @@
-"""Sample Weave reference clips into one compact archive in this repository's joint order."""
+"""Sample Weave clips into one compact archive in this repository's joint order.
+
+A split is a folder of Weave archives under ``data/``: the kinematic references (``test``) or the
+trajectories Weave's policy executed in simulation for the same clips (``rollout/test``). Both
+have the same fields; a rollout is named after its reference clip with ROLLOUT_SUFFIX appended.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +32,8 @@ ISAAC_BODIES = (
     "L_thumb_distal", "R_thumb_distal",
 )  # fmt: skip
 
+
+ROLLOUT_SUFFIX = "__policy_rollout"
 
 # A body joint further than this outside its limit marks a corrupted reference (an angle that
 # wrapped through pi), not an overshoot that the loader's projection onto the limits can absorb.
@@ -59,8 +66,9 @@ def prepare_dataset(weave: Path, output: Path, robot, split: str = "test", count
     """Write ``motion.npz`` and ``manifest.json`` with an object-balanced, seeded clip sample.
 
     Stored per frame: pelvis pose, joint positions in ``robot.joint_names`` order, object pose and
-    Weave's per-body contact labels (+1 contact, 0 neutral, -1 separated). Velocities and body
-    poses are recomputed at load time, so the archive stays small and self-consistent.
+    Weave's per-body contact labels (references: +1 contact, 0 neutral, -1 separated; rollouts: 1
+    where the measured contact force exceeds 1 N, else 0). Velocities and body poses are recomputed
+    at load time, so the archive stays small and self-consistent. Clips keep their reference names.
     """
     import torch
 
@@ -69,7 +77,7 @@ def prepare_dataset(weave: Path, output: Path, robot, split: str = "test", count
 
     files = sorted((Path(weave) / "data" / split).glob("*.npz"))
     if not files:
-        raise FileNotFoundError(f"No Weave reference archives under {Path(weave) / 'data' / split}")
+        raise FileNotFoundError(f"No Weave archives under {Path(weave) / 'data' / split}")
     quota = {i: count // len(files) for i in range(len(files))}
     for i in np.random.default_rng(seed).permutation(len(files))[: count % len(files)]:
         quota[int(i)] += 1
@@ -87,7 +95,7 @@ def prepare_dataset(weave: Path, output: Path, robot, split: str = "test", count
             objects = set(data["object_names"].tolist())
             if len(objects) != 1 or int(data["fps"][0]) != 50:
                 raise ValueError(f"{file.name}: expected one object at 50 Hz")
-            name, clips = objects.pop(), data["motion_names"]
+            name, clips = objects.pop(), np.array([str(clip).removesuffix(ROLLOUT_SUFFIX) for clip in data["motion_names"]])
             starts = np.concatenate(([0], np.cumsum(data["motion_lengths"])))
             arrays = {k: data[k] for k in ("body_pos_w", "body_quat_w", "object_pos_w", "object_quat_w", "contact_label")}
             joint_pos = data["joint_pos"][:, order]
@@ -122,7 +130,7 @@ def prepare_dataset(weave: Path, output: Path, robot, split: str = "test", count
         clip_names=np.array(clip_names), clip_objects=np.array(clip_objects), clip_lengths=np.array(lengths),
         joint_names=np.array(robot.joint_names), label_bodies=np.array(ISAAC_BODIES), fps=np.array(50))  # fmt: skip
     manifest = dict(
-        format_version=1, source="Weave reference motions (appolyn/Weave)", split=split, seed=seed,
+        format_version=1, source="Weave motions (appolyn/Weave)", split=split, seed=seed,
         clips=len(clip_names), frames=int(sum(lengths)), hours=sum(lengths) / 50 / 3600,
         per_object=per_object, source_sha256=sources, rejected_clips=rejected,
         fk_max_error_m=fk_error, joint_limit_max_excess_rad=max(limit_excess, 0.0),

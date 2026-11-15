@@ -2,7 +2,7 @@ import re
 
 import numpy as np
 
-from supermimic_hoi.prepare.dataset import select_clips
+from supermimic_hoi.prepare.dataset import ROLLOUT_SUFFIX, prepare_dataset, select_clips
 from supermimic_hoi.prepare.objects import (MAX_HULL_VERTICES, WEAVE_HULLS, cooked_parts, primitive_parts, primitive_vertices,
                                             read_primitive_colliders)  # fmt: skip
 
@@ -80,3 +80,30 @@ def test_cooked_parts_are_the_exported_weave_hulls(tmp_path):
     assert cooked_parts("tripod", tmp_path / "tripod") == parts  # cached
     with pytest.raises(ValueError, match="No exported collision hulls"):
         cooked_parts("clothesstand", tmp_path / "clothesstand")  # primitive colliders, not in the archive
+
+
+def test_rollout_archives_are_sampled_under_their_reference_clip_names(robot, tmp_path):
+    """A Weave rollout archive is a reference archive whose clip names carry ROLLOUT_SUFFIX."""
+    from supermimic_hoi.kinematics import Kinematics
+    from supermimic_hoi.prepare.dataset import ISAAC_BODIES
+    import torch
+
+    model = robot.model
+    isaac_joints = [model.joint(model.body_jntadr[model.body(b).id]).name for b in ISAAC_BODIES[1:]]
+    frames, lengths = 6, [2, 4]
+    q = torch.from_numpy(robot.default_joint_pos).repeat(frames, 1)
+    root = torch.tensor([0.0, 0.0, 0.8]).repeat(frames, 1)
+    zero = torch.zeros(frames, 3)
+    body_pos = Kinematics(robot, bodies=ISAAC_BODIES).forward(root, torch.eye(3).repeat(frames, 1, 1), zero, zero, q, torch.zeros_like(q))[0]
+    identity = np.tile(np.array([1.0, 0, 0, 0], dtype=np.float32), (frames, 1))
+    folder = tmp_path / "data" / "rollout" / "test"
+    folder.mkdir(parents=True)
+    np.savez(folder / "box_rollout.npz",
+             joint_pos=q.numpy()[:, [robot.joint_names.index(n) for n in isaac_joints]], body_pos_w=body_pos.numpy(),
+             body_quat_w=np.tile(identity[:, None], (1, len(ISAAC_BODIES), 1)), object_pos_w=np.zeros((frames, 3), np.float32),
+             object_quat_w=identity, contact_label=np.zeros((frames, len(ISAAC_BODIES)), np.float32),
+             motion_lengths=np.array(lengths), fps=np.array([50]), object_names=np.array(["box", "box"]),
+             motion_names=np.array([f"sub1_box_000_v00{ROLLOUT_SUFFIX}", f"sub1_box_001_v03{ROLLOUT_SUFFIX}"]))  # fmt: skip
+    manifest = prepare_dataset(tmp_path, tmp_path / "out", robot, "rollout/test", 2, 0)
+    assert manifest["clip_names"] == ["sub1_box_000_v00", "sub1_box_001_v03"] and manifest["split"] == "rollout/test"
+    assert manifest["frames"] == frames and manifest["fk_max_error_m"] < 1e-5
