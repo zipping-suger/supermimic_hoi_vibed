@@ -1,4 +1,11 @@
-"""Convex collision assets and explicit inertials for Weave's objects."""
+"""Convex collision assets and explicit inertials for Weave's objects.
+
+Collision shapes are the ones Weave simulates. Where Weave ships hand-fitted primitive colliders
+(``<name>.usda``, used for the clothes stand) those are converted to convex meshes. Every other
+object is a convex decomposition that PhysX computes when it loads Weave's USD; those hulls are
+exported once by ``export_weave_hulls.py`` into ``weave_hulls.npz``. Mass is Weave's density on
+the collision volume.
+"""
 
 from __future__ import annotations
 
@@ -14,9 +21,9 @@ OBJECT_DIR = "source/g1_hoi_learning/g1_hoi_learning/objects"
 # Weave spawns every object with density 200 kg/m^3 on its collision volume; the large box uses 25.
 DENSITY = {"largebox": 25.0}
 DEFAULT_DENSITY = 200.0
-FRICTION = (0.8, 0.005, 0.0001)
-MAX_PARTS = 32
-MAX_HULL_VERTICES = 32
+FRICTION = (1.0, 0.005, 0.0001)
+MAX_HULL_VERTICES = 32  # Weave's hull vertex limit; MuJoCo-Warp needs small hulls too
+WEAVE_HULLS = Path(__file__).with_name("weave_hulls.npz")
 CONTEXT_FIELDS = ("mass", "com_x", "com_y", "com_z", "Ixx", "Iyy", "Izz", "Ixy", "Ixz", "Iyz",
                   "sliding_friction", "torsional_friction", "rolling_friction")  # fmt: skip
 
@@ -40,29 +47,85 @@ def capped_hull(vertices: np.ndarray):
     return trimesh.Trimesh(points).convex_hull
 
 
-def decompose(mesh_path: Path, part_dir: Path) -> list[Path]:
-    """CoACD convex parts of one object mesh, cached on the mesh checksum."""
-    import coacd
-    import trimesh
+# Vertices around a primitive's axis. A capsule uses four rings and two poles (30 vertices), a
+# cylinder two rings (32), so both stay within MAX_HULL_VERTICES.
+CAPSULE_SIDES, CYLINDER_SIDES = 7, 16
 
-    digest = hashlib.sha256(mesh_path.read_bytes()).hexdigest()
-    settings = dict(mesh_sha256=digest, coacd="1.0.14", threshold=0.05, max_convex_hull=MAX_PARTS,
-                    max_hull_vertices=MAX_HULL_VERTICES, seed=0)  # fmt: skip
+
+def read_primitive_colliders(usda: Path) -> list[dict]:
+    """Capsule and cylinder colliders of a Weave ``.usda``: name, kind, radius, height and the
+    4x4 transform (USD row-vector convention) into the object frame."""
+    import re
+
+    text = usda.read_text()
+    number = r"[-+0-9.eE]+"
+    colliders = []
+    for kind, name, body in re.findall(r'def (\w+) "(\w+)" \(\s*prepend apiSchemas = \["PhysicsCollisionAPI"\]\s*\)\s*\{(.*?)\n    \}', text, re.S):
+        if kind not in ("Capsule", "Cylinder") or 'token axis = "Z"' not in body or 'xformOpOrder = ["xformOp:transform"]' not in body:
+            raise ValueError(f"Unsupported collider {name} ({kind}) in {usda}")
+        radius, height = (float(re.search(rf"double {key} = ({number})", body).group(1)) for key in ("radius", "height"))
+        matrix = re.search(r"matrix4d xformOp:transform = \((.*)\)\s*\n", body).group(1)
+        transform = np.array([float(x) for x in re.findall(number, matrix)]).reshape(4, 4)
+        colliders.append(dict(name=name, kind=kind.lower(), radius=radius, height=height, transform=transform))
+    if not colliders or text.count("PhysicsCollisionAPI") != len(colliders):
+        raise ValueError(f"Could not read every collider of {usda}")
+    return colliders
+
+
+def primitive_vertices(kind: str, radius: float, height: float) -> np.ndarray:
+    """Vertices of a convex polyhedron standing in for a z-axis capsule or cylinder.
+
+    The polygonal cross-section has the area of the circle, so the cylindrical part keeps its
+    volume (and with it Weave's mass) while its faces stay within 4 % of the true radius.
+    """
+    sides = CAPSULE_SIDES if kind == "capsule" else CYLINDER_SIDES
+    angle = 2 * np.pi * np.arange(sides) / sides
+    ring = np.sqrt(2 * np.pi / (sides * np.sin(2 * np.pi / sides))) * radius * np.stack((np.cos(angle), np.sin(angle)), -1)
+    level = lambda scale, z: np.concatenate((scale * ring, np.full((sides, 1), z)), -1)  # noqa: E731
+    half = height / 2
+    if kind == "cylinder":
+        return np.concatenate((level(1.0, -half), level(1.0, half)))
+    cap, lift = np.cos(np.pi / 4), radius * np.sin(np.pi / 4)
+    return np.concatenate((level(1.0, -half), level(1.0, half), level(cap, -half - lift), level(cap, half + lift),
+                           [[0.0, 0.0, -half - radius], [0.0, 0.0, half + radius]]))  # fmt: skip
+
+
+def primitive_parts(usda: Path, part_dir: Path) -> list[Path]:
+    """Convex parts built from Weave's primitive colliders, cached on the file checksum."""
+    settings = dict(usda_sha256=hashlib.sha256(usda.read_bytes()).hexdigest(), capsule_sides=CAPSULE_SIDES,
+                    cylinder_sides=CYLINDER_SIDES, max_hull_vertices=MAX_HULL_VERTICES)  # fmt: skip
     marker = part_dir / "complete.json"
-    if marker.is_file() and json.loads(marker.read_text()) == settings:
+    if marker.is_file() and json.loads(marker.read_text())["settings"] == settings:
         return sorted(part_dir.glob("part_*.obj"))
-    mesh = trimesh.load(mesh_path, force="mesh", process=True)
-    coacd.set_log_level("warn")
-    parts = coacd.run_coacd(coacd.Mesh(np.asarray(mesh.vertices), np.asarray(mesh.faces)), threshold=0.05,
-                            max_convex_hull=MAX_PARTS, preprocess_mode="auto", resolution=2000,
-                            mcts_nodes=10, mcts_iterations=50, mcts_max_depth=3, seed=0)  # fmt: skip
-    if not parts:
-        raise ValueError(f"Empty collision decomposition: {mesh_path}")
     shutil.rmtree(part_dir, ignore_errors=True)
     part_dir.mkdir(parents=True)
-    for i, (vertices, _) in enumerate(parts):
-        capped_hull(vertices).export(part_dir / f"part_{i:03}.obj")
-    marker.write_text(json.dumps(settings, indent=2) + "\n")
+    for i, collider in enumerate(read_primitive_colliders(usda)):
+        local = primitive_vertices(collider["kind"], collider["radius"], collider["height"])
+        transform = collider["transform"]
+        capped_hull(local @ transform[:3, :3] + transform[3, :3]).export(part_dir / f"part_{i:03}.obj")
+    marker.write_text(json.dumps(dict(settings=settings), indent=2) + "\n")
+    return sorted(part_dir.glob("part_*.obj"))
+
+
+def cooked_parts(name: str, part_dir: Path) -> list[Path]:
+    """The convex hulls PhysX cooks for one of Weave's mesh colliders, cached on the archive checksum."""
+    import trimesh
+
+    settings = dict(weave_hulls_sha256=hashlib.sha256(WEAVE_HULLS.read_bytes()).hexdigest())
+    marker = part_dir / "complete.json"
+    if marker.is_file() and json.loads(marker.read_text())["settings"] == settings:
+        return sorted(part_dir.glob("part_*.obj"))
+    with np.load(WEAVE_HULLS) as archive:
+        hulls = [archive[key].astype(np.float64) for key in sorted(archive.files) if key.split("/")[0] == name]
+    if not hulls:
+        raise ValueError(f"No exported collision hulls for {name}; run prepare/export_weave_hulls.py")
+    if max(map(len, hulls)) > MAX_HULL_VERTICES:
+        raise ValueError(f"A hull of {name} exceeds {MAX_HULL_VERTICES} vertices")
+    shutil.rmtree(part_dir, ignore_errors=True)
+    part_dir.mkdir(parents=True)
+    for i, vertices in enumerate(hulls):
+        trimesh.Trimesh(vertices).convex_hull.export(part_dir / f"part_{i:03}.obj")
+    marker.write_text(json.dumps(dict(settings=settings), indent=2) + "\n")
     return sorted(part_dir.glob("part_*.obj"))
 
 
@@ -76,7 +139,9 @@ def prepare_objects(weave: Path, output: Path, names: list[str]) -> dict:
     values = lambda x: " ".join(f"{v:.12g}" for v in np.asarray(x).flatten())  # noqa: E731
     for name in sorted(set(names)):
         source = Path(weave) / OBJECT_DIR / name / f"{name}.obj"
-        parts = decompose(source, output / "parts" / name)
+        primitives = source.with_suffix(".usda")
+        part_dir = output / "parts" / name
+        parts = primitive_parts(primitives, part_dir) if primitives.is_file() else cooked_parts(name, part_dir)
         visual = output / "visual" / f"{name}.obj"
         visual.parent.mkdir(exist_ok=True)
         shutil.copyfile(source, visual)

@@ -17,8 +17,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Offline asset preparation (URDF conversion, convex decomposition).
-assets = ["coacd==1.0.14", "trimesh", "scipy"]
+# Offline asset preparation (URDF conversion, collision meshes).
+assets = ["trimesh", "scipy"]
 # Side-by-side rollout videos.
 render = ["imageio-ffmpeg"]
 tracking = ["swanlab==0.10.3"]

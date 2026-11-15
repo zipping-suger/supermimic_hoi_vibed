@@ -56,9 +56,14 @@ This writes `data/` (git-ignored, about 70 MB):
 - `data/robot/`: `g1_inspire.xml`, compiled from Weave's URDF. Every link is a body, the pelvis
   is free, and collision geometry is the link's convex hull capped at 32 vertices (foot and
   shoulder cylinders become capsules, as in Weave's import). Self-collision is disabled, as in Weave.
-- `data/objects/`: one MJCF per object with CoACD convex parts (at most 32, each capped at 32
-  vertices) and an explicit inertial. Mass is Weave's density (200 kg/m^3, large box 25) times the
-  volume of the convex parts; friction is 0.8.
+- `data/objects/`: one MJCF per object with convex collision parts and an explicit inertial. The
+  shapes are the ones Weave simulates. The clothes stand uses Weave's hand-fitted primitive
+  colliders (a cylinder base, a capsule pole and eight capsule pegs), converted to convex meshes.
+  Every other object uses the convex decomposition that PhysX computes when it loads Weave's USD
+  (1 to 32 hulls of at most 32 vertices). Those hulls exist only inside Isaac Sim, so
+  `prepare/export_weave_hulls.py` exports them once, with Isaac Sim 5.1, into
+  `prepare/weave_hulls.npz`. Mass is Weave's rule, density (200 kg/m^3, large box 25) times the
+  collision volume; friction is 1.
 - `data/weave600/`: 600 clips (1.37 h at 50 Hz) sampled from Weave's test split with seed 0,
   66 or 67 per object over nine objects, covering all 321 base interactions before taking a second
   approach variant of any. Stored per frame: pelvis pose, 53 joint positions, object pose and Weave's
@@ -109,15 +114,15 @@ keep their weight.
 
 **Reset states.** Episodes start at the clip's first frame (25 %), ten frames before a sustained
 contact phase (25 %) or uniformly within the clip (50 %). Weave's references are kinematic and
-overlap the ground and the object: the deepest overlap exceeds 10 mm in 62 % of frames and reaches
+overlap the ground and the object: the deepest overlap exceeds 10 mm in 60 % of frames and reaches
 0.38 m (feet under the floor while crouching). Resetting MuJoCo into deep overlap launches bodies,
 so every proposed start is moved to the nearest frame of its clip whose overlaps are within
 `reset_overlap_tolerance`. How deep is harmless depends on the pair, so there is one tolerance per
-kind: 40 mm between a hand and the object (the references grasp with the fingers a median 24 mm
-inside it, and a finger is pushed out against a 1 Nm drive), 100 mm between the robot and the
+kind: 40 mm between a hand and the object (the references grasp with the fingers a median 22 mm
+inside it, even in Weave's own collision shapes, and a finger is pushed out against a 1 Nm drive), 100 mm between the robot and the
 ground, and 20 mm for everything else (body against object, object against ground). This admits
-89 % of all frames and 81 % of the frames in which the reference touches the object, at least 181
-per clip. A single 20 mm tolerance admitted only 17 % of the contact frames, so episodes almost
+90 % of all frames and 82 % of the frames in which the reference touches the object, at least 181
+per clip. A single 20 mm tolerance admits only 24 % of the contact frames, so episodes almost
 never started with the object in hand. `audit` measures the admitted resets on the training
 physics.
 
@@ -143,7 +148,9 @@ capacity stop training. An invalid learner update (nonfinite, or a gradient norm
 `max_gradient_norm`) is skipped entirely on the device and then stops training with a checkpoint.
 
 **Randomization.** Robot friction (0.3 to 1.2, once per world), torso centre of mass (once per
-world), encoder offsets (0.01 rad, per episode) and observation noise. The world model, contact
+world), encoder offsets (0.01 rad, per episode) and observation noise. Ground and object friction
+are 1 in training and evaluation; MuJoCo uses the larger friction of a contact pair, so robot
+friction changes a contact only above 1. The world model, contact
 head and critic see these parameters and the object's mass properties; the actor does not.
 
 ### Differences from BlinkMimic HOI
@@ -173,10 +180,10 @@ run has been made yet.
 
 | Check | Result |
 |---|---|
-| `pytest` | 42 passed: 38 on CPU, 4 on the GPU (Warp against CPU physics, physics guard, training with all six CUDA graphs) |
+| `pytest` | 44 passed: 40 on CPU, 4 on the GPU (Warp against CPU physics, physics guard, training with all six CUDA graphs) |
 | Preparation | Torch FK reproduces Weave's recorded body positions within 0.002 mm on all 600 clips |
-| `audit --steps 10` | 220,797 admissible reset frames restored within 4.8e-6 of the reference; over ten reference-PD steps none was rejected numerically and 2,423 (1.1 %) terminated on the object's position or tilt. Open-loop PD does not hold a carried object: 2.3 % of contact-phase resets without any hand-object overlap terminate, and 3.2 % of those 30 to 40 mm deep |
-| Training, 500 iterations | 0.242 s per iteration (12,400 simulator transitions per second), 8.8 GiB device memory, no rejected transition; compilation adds several minutes on the first run |
+| `audit --steps 10` | 221,287 admissible reset frames restored within 4.8e-6 of the reference; over ten reference-PD steps none was rejected numerically and 2,698 (1.2 %) terminated, all but 16 on the object's position or tilt. Open-loop PD does not hold a carried object: 2.2 % of contact-phase resets without any hand-object overlap terminate, and 4.5 % of those 30 to 40 mm deep |
+| Training, 500 iterations | 0.237 s per iteration (12,600 simulator transitions per second), 8.7 GiB device memory, no rejected transition; compilation adds several minutes on the first run |
 | The same setup without compilation or graphs | 1.92 s per iteration |
-| Learning signals over those 500 iterations | world-model loss 7.6 to 0.55, mean episode length 32 to 92 steps, imagined survival 0.14 to 0.67 |
-| `evaluate` on that checkpoint | 0 of 600 clips completed, mean progress 0.44, contact on 20 % of intended hand-steps: the policy follows the approach and then loses the object, as expected after two minutes of training |
+| Learning signals over those 500 iterations | world-model loss 7.7 to 0.48, mean episode length 32 to 91 steps, imagined survival 0.15 to 0.69 |
+| `evaluate` on that checkpoint | 1 of 600 clips completed, mean progress 0.45, contact on 25 % of intended hand-steps: the policy follows the approach and then loses the object, as expected after two minutes of training |

@@ -65,9 +65,9 @@ class Randomizer:
             default = sim.get_default_field("body_ipos")
             default = default[:, torso] if default.ndim == 3 else default[torso]
             sim.model.body_ipos[:, torso] = default + com
-        # MuJoCo takes the larger friction of a pair, so the ground sits at the bottom of the range
-        # and the robot's own friction decides every robot-ground contact.
-        sim.model.geom_friction[:, ground_geoms, 0] = FRICTION_RANGE[0] if self.enabled else 1.0
+        # Ground and objects have friction 1 in training and evaluation alike. MuJoCo takes the
+        # larger friction of a pair, so a robot friction below 1 leaves its contacts at 1.
+        sim.model.geom_friction[:, ground_geoms, 0] = 1.0
         sim.model.geom_friction[:, robot_geoms, 0] = self.xi[:, self.layout.friction]
 
     def resample(self, mask):
