@@ -127,7 +127,8 @@ class TrainConfig:
     pi_beta1: float = 0.9
     pi_clip_value: float = 0.1
     grad_clip_norm: float = 1.0
-    max_gradient_norm: float = 1e4  # a larger pre-clipping norm stops training instead of updating
+    max_gradient_norm: float = 1e4  # an update with a larger pre-clipping norm is skipped
+    max_skipped_updates: int = 20  # consecutive skipped updates of one model that stop training
     norm_max_count: float = 2e8  # running normalizers freeze after this many rows
     body_action_clip: float = 20.0
 
@@ -165,7 +166,8 @@ class TrainConfig:
         self.reward.validate()
         for name in ("num_envs", "max_episode_steps", "nconmax", "njmax", "iterations", "collect_steps", "buffer_steps",
                      "warmup_steps", "wm_window", "wm_batch", "wm_updates", "history", "future", "pi_batch", "horizon",
-                     "critic_epochs", "critic_minibatches", "lr_decay_iters", "lr_decay_len", "log_every", "save_every"):  # fmt: skip
+                     "critic_epochs", "critic_minibatches", "lr_decay_iters", "lr_decay_len", "log_every", "save_every",
+                     "max_skipped_updates"):  # fmt: skip
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
         for name in ("max_linear_speed", "max_angular_speed", "max_joint_speed", "lr", "pi_lr_mult", "grad_clip_norm",

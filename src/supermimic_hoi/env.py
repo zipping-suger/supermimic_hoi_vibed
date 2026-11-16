@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from .control import Controller
+from .geometry import ObjectGeometry
 from .mdp import HOIMDP, force_scores
 from .motion import Motion
 from .randomization import ContextLayout, Randomizer
@@ -100,15 +101,20 @@ class HOIEnv:
         return contact, scores, reward, terms, failure, reasons, obs
 
     @torch.no_grad()
-    def step(self, action):
-        """Apply one action everywhere and return the transition. Does not reset finished episodes."""
+    def step(self, action, noise=None):
+        """Apply one action everywhere and return the transition. Does not reset finished episodes.
+
+        ``noise`` perturbs only what the drives execute. The action that the policy observes next
+        and that the action costs score is the one it chose, as in imagination and evaluation.
+        """
         m, c = self.motion, self.controller
         state = self.physics.state()
         f, age = self.f.clone(), self.age.clone()
         previous, hand, context = self.previous_action.clone(), self.hand_targets.clone(), self.context.clone()
         f1 = m.next_frame(f)
         action = c.bound_action(action, m.q[f1])
-        target, hand1 = c(action, m.q[f1], hand, self.mdp.layout.offsets(context))
+        executed = action if noise is None else c.bound_action(action + noise, m.q[f1])
+        target, hand1 = c(executed, m.q[f1], hand, self.mdp.layout.offsets(context))
         state1, hand_force, finger_force, valid = self.physics.step(target)
         contact, scores, reward, terms, failure, reasons, obs1 = self.transition_fn(
             state1, f1, action, previous, hand1, context, hand_force, finger_force, age == 0)  # fmt: skip
@@ -149,7 +155,8 @@ def make_task(cfg) -> Task:
     if cfg.device.startswith("cuda"):
         torch.cuda.empty_cache()  # release reference-FK scratch before Warp allocates its workspace
     controller = Controller(robot, cfg.device, body_action_clip=cfg.body_action_clip)
-    mdp = HOIMDP(motion, controller, ContextLayout(robot, cfg.device), cfg.reward, noise=cfg.randomize)
+    geometry = ObjectGeometry(cfg.object_assets, motion.object_names, cfg.device)
+    mdp = HOIMDP(motion, controller, ContextLayout(robot, cfg.device), cfg.reward, cfg.randomize, geometry)
     env = HOIEnv(motion, controller, mdp, robot, registry, cfg)
     signature = hashlib.sha256((motion.signature + object_signature + robot_signature(robot)).encode()).hexdigest()
     return Task(robot, registry, motion, controller, mdp, env, signature)

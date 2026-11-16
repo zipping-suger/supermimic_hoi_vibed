@@ -11,8 +11,9 @@ the BlinkMimic HOI design; the robot, objects and reference motions are
 - **Dynamic objects.** Objects move only through contact: no virtual spring, support wrench or
   reference force. Physics is MuJoCo-Warp through mjlab, four 5 ms steps per control step.
 - **Coupled world model.** One MLP predicts robot and object increments, conditioned on a one-hot
-  object key and the physical context. Imagination uses tensor kinematics and analytic rewards
-  only; it never queries contact geometry.
+  object key, the physical context and the distances from the hands to the object's surface.
+  Imagination uses tensor kinematics, analytic rewards and each object's signed distance field;
+  it never runs collision detection.
 - **Learned contact reward.** A separate small head predicts ten per-finger force scores from
   measured simulator contact; actor updates differentiate through its frozen weights.
 - **Actor and critic.** A deterministic actor (motion encoder + history decoder) maximizes a
@@ -28,7 +29,7 @@ the BlinkMimic HOI design; the robot, objects and reference motions are
 | `robot.py`, `kinematics.py`, `rotations.py` | G1 + Inspire description, torch FK built from the MJCF, rotation utilities |
 | `motion.py` | Reference library: clips, finite-difference velocities, FK of tracked bodies, goals |
 | `control.py` | Actions to PD targets (reference skip, finger filter, mimic joints) |
-| `mdp.py` | Observation, reward and termination, shared by simulation and imagination |
+| `mdp.py`, `geometry.py` | Observation, reward and termination, shared by simulation and imagination; signed distance fields of the objects |
 | `sim.py`, `contacts.py`, `variant_collision.py` | CPU and MuJoCo-Warp physics, physics guard, hand-object contact forces |
 | `randomization.py`, `reset_guard.py`, `env.py` | Domain randomization and context, penetration screen for resets, the vector environment |
 | `networks.py`, `optim.py`, `learning.py` | World model, contact head, actor, critic; Muon+Adam; returns and the gated update |
@@ -51,7 +52,7 @@ in `data/test/` (see Weave's README; the archives come from `appolyn/Weave` on H
 uv run python -m supermimic_hoi.prepare --weave /path/to/Weave
 ```
 
-This writes `data/` (git-ignored, about 70 MB):
+This writes `data/` (git-ignored, about 120 MB):
 
 - `data/robot/`: `g1_inspire.xml`, compiled from Weave's URDF. Every link is a body, the pelvis
   is free, and collision geometry is the link's convex hull capped at 32 vertices (foot and
@@ -63,7 +64,9 @@ This writes `data/` (git-ignored, about 70 MB):
   (1 to 32 hulls of at most 32 vertices). Those hulls exist only inside Isaac Sim, so
   `prepare/export_weave_hulls.py` exports them once, with Isaac Sim 5.1, into
   `prepare/weave_hulls.npz`. Mass is Weave's rule, density (200 kg/m^3, large box 25) times the
-  collision volume; friction is 1.
+  collision volume; friction is 1. `geometry.npz` holds, per object, the hull vertices and a
+  64 x 64 x 144 grid of the signed distance to the collision shape and its direction, reaching
+  0.15 m beyond the shape.
 - `data/weave600/`: 600 clips (1.37 h at 50 Hz) sampled from Weave's test split with seed 0,
   66 or 67 per object over nine objects, covering all 321 base interactions before taking a second
   approach variant of any. Stored per frame: pelvis pose, 53 joint positions, object pose and Weave's
@@ -96,7 +99,9 @@ uv run python -m supermimic_hoi.render --clip sub17_smallbox_034_v03 --output re
 `TrainConfig` in `config.py` is the single list of options; a JSON config and the command-line
 flags of `train` override its defaults. `configs/weave600.json` (600 worlds, batches of 1,024)
 fits a 16 GB GPU. `configs/weave600_large.json` (4,200 worlds, batches of 8,192) mirrors the
-allocation BlinkMimic HOI used on large GPUs and has not been run from this repository.
+allocation BlinkMimic HOI used on large GPUs. Device memory is about 4.3 MiB per world (replay and
+simulator) plus the learners' working memory, which grows with the batch: 45 clips on 1,800 worlds
+with batches of 2,048 take 19.4 GiB.
 
 Training writes `config.json`, `reset_guard.json`, `metrics.jsonl` and checkpoints to `log_dir`.
 `--resume` restores networks, normalizers, optimizers and counters; episodes and replay start
@@ -106,7 +111,10 @@ run named after the log directory). Run `uv run swanlab login` once; `--swanlab-
 `disabled` turns the upload off.
 
 The first run compiles the collection and learning functions, which takes several minutes;
-later runs reuse the compiler cache.
+later runs reuse the compiler cache. Keep that cache (`TORCHINDUCTOR_CACHE_DIR`, by default under
+`/tmp`) on a local disk. On a network file system shared by concurrent runs, two runs that compile
+the same kernels replace each other's cache files and one of them stops with
+`OSError: Stale file handle`.
 
 ## Design notes
 
@@ -134,6 +142,19 @@ per clip. A single 20 mm tolerance admits only 24 % of the contact frames, so ep
 never started with the object in hand. `audit` measures the admitted resets on the training
 physics.
 
+**Hand-to-surface input.** For both wrists and the ten fingertips, the signed distance to the
+object's collision surface and the direction away from it are read from the object's distance
+field at the body's position in the object frame (trilinear, differentiable in that position).
+The actor, the critic, the world model and the contact-reward head all receive them. Without them
+the networks know the object only by its one-hot key and must memorize where each surface is;
+with them the world model's object error on a 108-clip test fell from 1.25 to 0.70.
+
+**Exploration.** Gaussian noise (`exploration`) is added to what the drives execute, not to the
+action that is recorded: replay, the next observation's previous action and the action-rate cost
+all hold the actor's own output. The world model therefore learns the response to the policy's
+commands with the noise as part of the dynamics, and imagined rollouts start from action
+histories the actor itself produced.
+
 **Rewards** (weights in `RewardConfig`, each scaled by the 0.02 s step): exponential tracking of
 the pelvis, 13 further bodies and the object (position, orientation, velocity); fingertip positions
 in the object frame for hands the reference has in contact; the contact score; and costs on the
@@ -146,14 +167,22 @@ saturation. The contact score averages the force scores of each hand's intended 
 the vertical component of the body's z axis, so a yaw error never ends an episode; it is penalized
 by the orientation rewards. Imagination uses a smooth surrogate of the same conditions and never
 rolls past the end of a clip. Contact is rewarded but is not a termination condition: neither the
-world model nor the critic carries a contact state, and `evaluate` reports contact coverage beside
-the completion rate.
+world model nor the critic carries a contact state.
+
+**Evaluation.** Termination only bounds how far an episode may drift, so reaching the last frame
+(`completion_rate`) does not show that the interaction happened: an object left where it stood
+stays within 0.3 m of many references. `success_rate` additionally requires that the object stayed
+within 0.2 m and 0.8 rad of its reference throughout, covered at least half of the reference
+object's path, and left the ground if the reference lifts it (lowest collision vertex above 0.08 m
+for ten steps). `evaluate` reports both rates per object, the criteria each clip missed and the
+share of intended hand-steps with measured contact.
 
 **Physics guard.** A world whose speeds leave generous numerical limits is restored to its last
 valid state inside the step, reported as an invalid transition and reset; it never reaches replay
 or normalizer statistics. Nonfinite states, nonfinite targets and exhausted contact or constraint
 capacity stop training. An invalid learner update (nonfinite, or a gradient norm above
-`max_gradient_norm`) is skipped entirely on the device and then stops training with a checkpoint.
+`max_gradient_norm`) is skipped entirely on the device, counted and logged; training continues and
+stops with a checkpoint only after `max_skipped_updates` consecutive skips of one model.
 
 **Randomization.** Robot friction (0.3 to 1.2, once per world), torso centre of mass (once per
 world), encoder offsets (0.01 rad, per episode) and observation noise. Ground and object friction
@@ -177,21 +206,29 @@ head and critic see these parameters and the object's mass properties; the actor
   object termination (0.3 m, tilt 0.3).
 - `max_episode_steps` is 1,000 (Weave's 20 s) so a clip of up to 639 frames can be completed
   from its first frame.
+- The actor, critic, world model and contact head receive hand-to-surface distances from the
+  objects' signed distance fields; BlinkMimic HOI's networks know an object only by its key.
+- Exploration noise is executed but not recorded: replay holds the actor's own action.
 - Legacy recipes, alternative reward modes, adaptive sampling, settle tails, fine-tuning, replay
   offload and the diagnostic tools were not carried over.
 
 ## Validation
 
-Measured on one RTX 4080 (16 GB) with `configs/weave600.json`. These checks show that the pipeline
-runs and is numerically sound. They do not show that a policy learns the task: no long training
-run has been made yet.
+Measured with the rollout dataset (`prepare --split rollout/test`).
 
 | Check | Result |
 |---|---|
-| `pytest` | 45 passed: 41 on CPU, 4 on the GPU (Warp against CPU physics, physics guard, training with all six CUDA graphs) |
-| Preparation | Torch FK reproduces Weave's recorded body positions within 0.002 mm on all 600 clips |
-| `audit --steps 10` | 221,287 admissible reset frames restored within 4.8e-6 of the reference; over ten reference-PD steps none was rejected numerically and 2,698 (1.2 %) terminated, all but 16 on the object's position or tilt. Open-loop PD does not hold a carried object: 2.2 % of contact-phase resets without any hand-object overlap terminate, and 4.5 % of those 30 to 40 mm deep |
-| Training, 500 iterations | 0.237 s per iteration (12,600 simulator transitions per second), 8.7 GiB device memory, no rejected transition; compilation adds several minutes on the first run |
-| The same setup without compilation or graphs | 1.92 s per iteration |
-| Learning signals over those 500 iterations | world-model loss 7.7 to 0.48, mean episode length 32 to 91 steps, imagined survival 0.15 to 0.69 |
-| `evaluate` on that checkpoint | 1 of 600 clips completed, mean progress 0.45, contact on 25 % of intended hand-steps: the policy follows the approach and then loses the object, as expected after two minutes of training |
+| `pytest` | 49 passed: 45 on CPU, 4 on the GPU (Warp against CPU physics, physics guard, training with all six CUDA graphs) |
+| Preparation | Torch FK reproduces Weave's recorded body positions within 0.010 mm on all 600 clips |
+| `audit --steps 10` | 245,282 of 245,910 frames are admissible reset states (128,722 of the 128,850 contact frames) and are restored within 5.2e-6 of the reference; over ten reference-PD steps none was rejected numerically and 1,275 (0.5 %) terminated, all on the object's position or tilt |
+| Training, 500 iterations of `configs/weave600.json` on an RTX 4080 (16 GB) | 0.278 s per iteration (10,750 simulator transitions per second), 9.7 GiB device memory, no rejected transition, no skipped update |
+| Learning signals over those 500 iterations | world-model loss 4.5 to 0.62, mean episode length 31 to 94 steps, imagined survival 0.13 to 0.67 |
+| `evaluate` on that checkpoint | no clip completed, mean progress 0.48, contact on 52 % of intended hand-steps: the policy follows the approach and then loses the object, as expected after two minutes of training |
+| 45 clips, 1,800 worlds, batches of 2,048 on an RTX 4090 D (24 GB) | 19.4 GiB device memory, 0.37 s per iteration |
+| 108 clips (12 per object), 4,320 worlds, batches of 2,048, 20,000 iterations on an H20, two seeds | success on 89.2 % and 90.7 % of the clips (completion 92.6 % and 96.0 %). Without the hand-to-surface input: 58.3 % and 71.0 % (completion 67.9 % and 78.1 %) |
+| 600 clips, 8,400 worlds, batches of 8,192 on an H20, without the hand-to-surface input | success on 55.5 % of the clips after 10,000 iterations and 65.2 % after 20,000 (completion 65.5 % and 74.8 %) |
+
+The 108-clip comparison was run on the experimental predecessor of this code, where the
+hand-to-surface input was a switch; the computation is the same. This version itself has been run
+for the 500-iteration checks above. No 600-clip training with the hand-to-surface input has been
+made yet, and every policy was evaluated on the clips it was trained on.

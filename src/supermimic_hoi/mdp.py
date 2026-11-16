@@ -1,9 +1,10 @@
 """Analytic observation, reward and termination heads.
 
 Everything here is tensor arithmetic on a state tuple and a reference frame, so the same code
-labels real simulator transitions and differentiates through imagined ones. Contact enters only
-as numbers supplied by the caller: measured forces in simulation, the contact-reward head's
-finger scores in imagination. Contact is rewarded, never a termination condition.
+labels real simulator transitions and differentiates through imagined ones. Contact forces enter
+only as numbers supplied by the caller: measured in simulation, predicted by the contact-reward
+head in imagination. Distances to the object's surface come from its signed distance field.
+Contact is rewarded, never a termination condition.
 """
 
 from __future__ import annotations
@@ -15,6 +16,9 @@ from .motion import CONTROL_DT
 from .rotations import angle_squared, mat_to_6d, mm3, mv3, yaw_mat
 
 FAILURE_REASONS = ("root_position", "root_tilt", "object_position", "object_tilt")
+SURFACE_BODIES = ("left_wrist_yaw_link", "right_wrist_yaw_link")  # followed by the ten fingertips
+SURFACE_DIM = 5 * (len(SURFACE_BODIES) + len(R.FINGERTIPS))
+SURFACE_SCALE = 0.02  # distance [m] on which the surface features resolve the contact band
 
 
 def chain_product(value, dim):
@@ -47,14 +51,15 @@ def contact_score(finger_scores, finger_intent):
 
 
 class HOIMDP:
-    def __init__(self, motion, controller, layout, cfg, noise: bool):
+    def __init__(self, motion, controller, layout, cfg, noise: bool, geometry):
         self.motion, self.controller, self.layout, self.cfg, self.noisy = motion, controller, layout, cfg, noise
-        self.kin = motion.kin
+        self.geometry, self.kin = geometry, motion.kin
         device = motion.device
         J, A = controller.limits.shape[0], controller.num_body + controller.num_hand
         self.num_tracked = motion.num_tracked
         self.tips = torch.tensor(motion.tips, device=device)
         self.feet = torch.tensor(motion.feet, device=device)
+        self.keypoints = torch.tensor([R.TRACKED_BODIES.index(n) for n in SURFACE_BODIES] + motion.tips, device=device)
         margin = 0.05 * (self.kin.q_hi - self.kin.q_lo)
         self.soft_lo, self.soft_hi = self.kin.q_lo + margin, self.kin.q_hi - margin
         # Uniform noise half-widths on the proprioceptive head of the observation.
@@ -68,6 +73,23 @@ class HOIMDP:
     def fk(self, s):
         return self.kin.forward(*s[:6])
 
+    def hand_surface(self, s, f, fk=None):
+        """(..., 12, 4): signed distance of both wrists and the ten fingertips to the collision surface
+        of the object of frame ``f``, and the unit direction away from it in the object frame."""
+        body_p = (self.fk(s) if fk is None else fk)[0]
+        local = mv3(s[7].transpose(-1, -2).unsqueeze(-3), body_p[..., self.keypoints, :] - s[6].unsqueeze(-2))
+        return self.geometry.surface(self.motion.clip_object[self.motion.clip_id[f]], local)
+
+    def surface_features(self, s, f, fk=None):
+        """Per keypoint: distance, the same on a 2 cm scale that resolves the contact band, and the
+        direction away from the surface in the root's heading frame. An input of the actor, critic,
+        world model and contact-reward head."""
+        field = self.hand_surface(s, f, fk)
+        distance = field[..., :1]
+        heading_from_object = mm3(yaw_mat(s[1]).transpose(-1, -2), s[7])
+        return torch.cat((distance.clamp(-0.05, 0.3), torch.tanh(distance / SURFACE_SCALE),
+                          mv3(heading_from_object.unsqueeze(-3), field[..., 1:])), -1).flatten(-2)  # fmt: skip
+
     def add_noise(self, obs):
         if not self.noisy:
             return obs
@@ -78,7 +100,8 @@ class HOIMDP:
         """Noise-free actor observation of state ``s`` at reference frame ``f``."""
         p, Rm, v, w, q, qd, op, oR, ov, ow = s
         m = self.motion
-        body_p = (self.fk(s) if fk is None else fk)[0]
+        fk = self.fk(s) if fk is None else fk
+        body_p = fk[0]
         Ht, Rt = yaw_mat(Rm).transpose(-1, -2), Rm.transpose(-1, -2)
         tips = mv3(oR.transpose(-1, -2).unsqueeze(-3), body_p[..., self.tips, :] - op.unsqueeze(-2))
         return torch.cat((
@@ -87,7 +110,7 @@ class HOIMDP:
             mv3(Ht, op - p), mat_to_6d(mm3(Ht, oR)), mv3(Ht, ov - v), mv3(Ht, ow) * 0.25, tips.flatten(-2),
             hand_targets, m.key(f), m.finger_intent[f],
             # Global tracking error: observable even when robot and object drift together.
-            mv3(Ht, m.root_p[f] - p)), -1)  # fmt: skip
+            mv3(Ht, m.root_p[f] - p), self.surface_features(s, f, fk)), -1)  # fmt: skip
 
     def critic_input(self, s, f, previous_action, hand_targets, context, goal, fk=None):
         # Finger commands beyond [-1, 1] have identical physical effects; do not expose their
@@ -108,7 +131,8 @@ class HOIMDP:
         """
         m, c, T = self.motion, self.cfg, self.num_tracked
         p, Rm, v, w, q, qd, op, oR, ov, ow = s
-        bp, bR, bv, bw = self.fk(s) if fk is None else fk
+        fk = self.fk(s) if fk is None else fk
+        bp, bR, bv, bw = fk
         e_pos = (bp[..., :T, :] - m.body_p[f][..., :T, :]).square().sum(-1).mean(-1)
         e_ori = angle_squared(bR[..., :T, :, :], m.body_R[f]).mean(-1)
         e_vel = (bv[..., :T, :] - m.body_v[f]).square().sum(-1).mean(-1)

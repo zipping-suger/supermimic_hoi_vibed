@@ -5,6 +5,8 @@ from pathlib import Path
 import torch
 
 from supermimic_hoi.evaluate import evaluate, load_runner
+from supermimic_hoi.mdp import SURFACE_DIM
+from supermimic_hoi.networks import feature_dim
 from supermimic_hoi.runner import MODELS, Runner
 from supermimic_hoi.state import unpack
 
@@ -24,6 +26,34 @@ def test_actor_gradient_flows_through_dynamics_reward_head_and_finger_filter(tin
     body = runner.actor.dec[-1].weight.grad[:29].abs().sum()
     hand = runner.actor.dec[-1].weight.grad[29:].abs().sum()
     assert body > 0 and hand > 0 and runner.actor.enc[0].weight.grad.abs().sum() > 0
+
+
+def test_hand_surface_features_close_the_observation_and_enter_both_learned_models(tiny_config):
+    runner = Runner(tiny_config)
+    env = runner.env
+    features = runner.mdp.surface_features(env.physics.state(), env.f)
+    assert features.shape == (4, SURFACE_DIM) and torch.isfinite(features).all()
+    assert torch.equal(env.history[:, -1, -SURFACE_DIM:], features)
+    for model in (runner.wm, runner.reward_head):
+        assert model.net[0].in_features == feature_dim(runner.task.robot.num_joints, runner.motion.key(env.f).shape[-1], env.context.shape[-1], SURFACE_DIM)
+
+
+def test_an_invalid_update_is_skipped_and_only_a_run_of_them_stops_training(tiny_config):
+    runner = Runner(replace(tiny_config, max_skipped_updates=3))
+    bad, good, norm = torch.tensor(False), torch.tensor(True), torch.tensor(2e4)
+    for _ in range(2):
+        runner.admit(bad, "actor", norm, norm)
+    runner.admit(good, "actor", norm, norm)
+    runner.admit(bad, "critic", norm, norm)
+    for _ in range(2):
+        runner.admit(bad, "actor", norm, norm)
+    assert runner.skipped == {"actor": [4, 2], "critic": [1, 1]}
+    try:
+        runner.admit(bad, "actor", norm, norm)
+    except RuntimeError as error:
+        assert "3 consecutive invalid actor updates" in str(error) and (Path(tiny_config.log_dir) / "failure.pt").is_file()
+    else:
+        raise AssertionError("A run of invalid updates did not stop training")
 
 
 def test_padding_after_the_clip_end_is_inert(tiny_config):
@@ -62,10 +92,11 @@ def test_train_checkpoint_resume_and_evaluate(tiny_config):
     evaluator = load_runner(str(out / "last.pt"), device="cpu")
     assert evaluator.env.N == 2
     report, trajectories = evaluate(evaluator, record=[tiny_config.clips[0]])
-    assert report["clips"] == 2 and 0 <= report["success_rate"] <= 1
+    assert report["clips"] == 2 and 0 <= report["success_rate"] <= report["completion_rate"] <= 1
     for result in report["results"]:
         assert 1 <= result["steps"] <= result["reference_steps"]
         assert result["completed"] == (result["steps"] == result["reference_steps"] and not result["failure_reasons"])
+        assert result["success"] == (result["completed"] and not result["missed_criteria"])
     states = trajectories[tiny_config.clips[0]]
     assert states.shape == (report["results"][0]["steps"] + 1, 142)
 

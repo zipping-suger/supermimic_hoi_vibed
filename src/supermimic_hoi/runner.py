@@ -15,7 +15,7 @@ from .buffer import Replay
 from .cuda_graph import CUDACall, LearningGraphPool
 from .env import make_task
 from .learning import actor_objective, bounded_bootstrap, discounted_return_bound, gae_targets, guarded_step, lr_at
-from .mdp import FAILURE_REASONS
+from .mdp import FAILURE_REASONS, SURFACE_DIM
 from .networks import Actor, ContactRewardHead, Critic, RunningNorm, WorldModel
 from .optim import MuonAdam, load_optimizer, make_adam
 from .state import unpack
@@ -47,8 +47,8 @@ class Runner:
 
         env, J = self.env, self.task.robot.num_joints
         key_dim, context_dim = len(self.motion.object_names), env.context.shape[-1]
-        self.wm = WorldModel(J, key_dim, context_dim, cfg.hidden).to(cfg.device)
-        self.reward_head = ContactRewardHead(J, key_dim, context_dim, cfg.reward_head_hidden).to(cfg.device)
+        self.wm = WorldModel(J, key_dim, context_dim, SURFACE_DIM, cfg.hidden).to(cfg.device)
+        self.reward_head = ContactRewardHead(J, key_dim, context_dim, SURFACE_DIM, cfg.reward_head_hidden).to(cfg.device)
         self.actor = Actor(env.history.shape[-1], self.motion.goal_dim(cfg.future), self.task.robot.num_actions,
                            cfg.history, cfg.policy_hidden).to(cfg.device)  # fmt: skip
         self.ema = copy.deepcopy(self.actor).requires_grad_(False)
@@ -72,6 +72,7 @@ class Runner:
         self.ema_updates = 0
         self.decay_at = None  # iteration at which the actor learning-rate multiplier starts to ramp down
         self.rejected_transitions = 0
+        self.skipped = {}  # per model: [updates skipped as invalid, of which consecutive and most recent]
 
         # Compile one reusable imagination step rather than the whole unrolled horizon.
         compile_fn = (lambda fn, **options: torch.compile(fn, fullgraph=True, dynamic=False, **options)) if cfg.compile else (lambda fn, **options: fn)
@@ -102,17 +103,19 @@ class Runner:
     # ------------------------------------------------------------------ collection
     @torch.no_grad()
     def act(self, history, frames):
+        """The actor's action and the exploration noise to execute it with."""
         goal = self.motion.goal(frames, self.cfg.future)
         self.actor.obs_norm.update(history[:, -1])
         self.actor.goal_norm.update(goal)
         action = self.actor(history, goal)
-        return action + self.cfg.exploration * torch.randn_like(action)
+        return action, self.cfg.exploration * torch.randn_like(action)
 
     @torch.no_grad()
     def observe_transition(self, row):
         """Normalizer statistics count every fresh simulator transition exactly once."""
         s, s1 = unpack(row["s"]), unpack(row["s1"])
-        features = networks.transition_features(s, row["u"], self.motion.key(row["f"]), row["context"])
+        features = networks.transition_features(s, row["u"], self.motion.key(row["f"]), row["context"],
+                                                self.mdp.surface_features(s, row["f"]))  # fmt: skip
         self.wm.in_norm.update(features, row["valid"])
         self.wm.out_norm.update(self.wm.targets(s, s1), row["valid"])
         self.wm.error_norm.update(self.wm.increments(s, s1), row["valid"])
@@ -122,7 +125,7 @@ class Runner:
     def collect_step(self):
         """One fixed-shape control step of every world, including resets and randomization."""
         env = self.env
-        row = env.step(self._act(env.history, env.f))
+        row = env.step(*self._act(env.history, env.f))
         ok = env.physics.ok
         # After a fatal fault keep the evidence in place: no resets, and nothing is admitted.
         env.reset(row["cut"] & ok)
@@ -155,7 +158,7 @@ class Runner:
             s = tuple(select(valid, a, b) for a, b in zip(s, initial))
             u, context = select(valid, w["u"][:, i], w["u"][:, 0]), select(valid, w["context"][:, i], w["context"][:, 0])
             f = torch.where(valid, w["f"][:, i], w["f"][:, 0])
-            s = self.wm(s, u, self.motion.key(f), context)
+            s = self.wm(s, u, self.motion.key(f), context, self.mdp.surface_features(s, f))
             e = (self.wm.error(s, unpack(select(valid, w["s1"][:, i], w["s1"][:, 0]))) / scale).square()
             errors.append(e.mean(-1))
             groups.append(torch.stack((e[..., :12].mean(-1), torch.cat((e[..., 12 + body], e[..., 12 + J + body]), -1).mean(-1),
@@ -189,15 +192,15 @@ class Runner:
             u, context = select(valid, w["u"][:, i], w["u"][:, 0]), select(valid, w["context"][:, i], w["context"][:, 0])
             f = torch.where(valid, w["f"][:, i], w["f"][:, 0])
             target = select(valid, w["finger_score"][:, i], w["finger_score"][:, 0])
-            key = self.motion.key(f)
-            prediction = self.reward_head(s, u, key, context)
+            key, surface = self.motion.key(f), self.mdp.surface_features(s, f).detach()
+            prediction = self.reward_head(s, u, key, context, surface)
             losses.append((prediction - target).square().mean(-1))
             absolute.append((prediction - target).abs().mean(-1).detach())
             targets.append(target.mean(-1))
             predictions.append(prediction.detach().mean(-1))
             if i + 1 < steps:
                 with torch.no_grad():
-                    s = self.wm(s, u, key, context)
+                    s = self.wm(s, u, key, context, surface)
         mask = w["mask"]
         mean = lambda xs: (torch.stack(xs, 1) * mask).sum() / mask.sum().clamp_min(1)  # noqa: E731
         return mean(losses), mean(absolute), mean(targets), mean(predictions)
@@ -211,12 +214,12 @@ class Runner:
     def fit_wm(self) -> dict:
         w = self.replay.windows(self.cfg.wm_batch, self.cfg.wm_window)
         loss, groups, norm, ok = self._wm_update(w)
-        self.require(ok, "world model", loss, norm)
+        self.admit(ok, "wm", loss, norm)
         k = self.cfg.wm_window
         metrics = {"wm/loss": loss / k, "grad/wm": norm.clone(),
                    **{f"wm/{name}": value / k for name, value in zip(("root", "body", "hand", "object"), groups)}}  # fmt: skip
         loss, mae, target, prediction, norm, ok = self._reward_update(w)
-        self.require(ok, "contact reward head", loss, norm)
+        self.admit(ok, "contact_reward", loss, norm)
         metrics.update({"contact_reward/loss": loss, "contact_reward/mae": mae, "contact_reward/target_mean": target,
                         "contact_reward/prediction_mean": prediction, "grad/contact_reward": norm.clone()})  # fmt: skip
         return {k: v.detach().clone() for k, v in metrics.items()}
@@ -230,19 +233,20 @@ class Runner:
         with zero reward and certain termination.
         """
         features = self.mdp.critic_input(s, f, previous, hand, context, goal, fk)
+        surface = self.mdp.surface_features(s, f, fk)
         before = (s, hand, previous, history, fk)
-        s0, hand0, previous0, history0, f0, goal0, z0 = fallback
+        s0, hand0, previous0, history0, f0, goal0, z0, surface0 = fallback
         s = tuple(select(active, a, b) for a, b in zip(s, s0))
         hand, previous = select(active, hand, hand0), select(active, previous, previous0)
         history, goal, z = select(active, history, history0), select(active, goal, goal0), select(active, z, z0)
-        f1 = torch.where(active, f1, f0 + 1)
+        surface, f1 = select(active, surface, surface0), torch.where(active, f1, f0 + 1)
 
         qref = self.motion.q[f1]
         action = self.control.bound_action(self.actor(history, goal, z), qref)
         target, hand1 = self.control(action, qref, hand, self.mdp.layout.offsets(context))
         u = self.control.effective(target)
-        finger_scores = self.reward_head(s, u, key, context)
-        s = self.wm(s, u, key, context)
+        finger_scores = self.reward_head(s, u, key, context, surface)
+        s = self.wm(s, u, key, context, surface)
         fk = self.mdp.fk(s)
         reward, _ = self.mdp.reward(s, f1, action, previous, finger_scores, episode_start, fk)
         done = self.mdp.soft_termination(s, f1)
@@ -269,7 +273,7 @@ class Runner:
         goals = m.goal(frames.flatten(), c.future).unflatten(0, frames.shape)
         latents = self.actor.encode(goals[:-1].flatten(0, 1)).unflatten(0, (c.horizon, f.shape[0]))
         key, fk = m.key(f), self.mdp.fk(s)
-        fallback = (s, hand, previous, history, f, goals[0], latents[0])
+        fallback = (s, hand, previous, history, f, goals[0], latents[0], self.mdp.surface_features(s, f, fk))
         rewards, dones, features = [], [], []
         for t in range(c.horizon):
             s, hand, previous, history, fk, x, r, d = self._imagine_step(
@@ -337,7 +341,7 @@ class Runner:
         for _ in range(self.cfg.critic_epochs):
             for idx in torch.randperm(X.shape[0], device=X.device).tensor_split(self.cfg.critic_minibatches):
                 loss, norm, ok = self._critic_update(X[idx], Y[idx], valid[idx])
-                self.require(ok, "critic", loss, norm)
+                self.admit(ok, "critic", loss, norm)
                 losses.append(loss.clone())
                 norms.append(norm.clone())
         return torch.stack(losses).mean(), torch.stack(norms).max()
@@ -358,7 +362,7 @@ class Runner:
             model.requires_grad_(False)
         try:
             loss, X, rewards, dones, bootstrap, survival, norm, ok = self._actor_update(start)
-            self.require(ok, "actor", loss, norm)
+            self.admit(ok, "actor", loss, norm)
         finally:
             for model in frozen:
                 model.requires_grad_(True)
@@ -380,13 +384,21 @@ class Runner:
         return {k: v.detach().clone() for k, v in metrics.items()}
 
     # ------------------------------------------------------------------ bookkeeping
-    def require(self, ok, phase: str, loss, norm):
-        """Stop on an update that was skipped as invalid, keeping the pre-update checkpoint."""
-        if not bool(ok):
+    def admit(self, ok, model: str, loss, norm):
+        """Count an update that was skipped as invalid. A single one is an outlier batch and training
+        continues; ``max_skipped_updates`` in a row stop it and save the state they left untouched."""
+        count = self.skipped.setdefault(model, [0, 0])
+        if bool(ok):
+            count[1] = 0
+            return
+        count[0] += 1
+        count[1] += 1
+        print(f"Skipped an invalid {model} update at iteration {self.iteration + 1}: loss={float(loss):.6g}, "
+              f"gradient norm={float(norm):.6g}", flush=True)  # fmt: skip
+        if count[1] >= self.cfg.max_skipped_updates:
             path = Path(self.cfg.log_dir) / "failure.pt"
             self.save(path)
-            raise RuntimeError(f"Invalid {phase} update at iteration {self.iteration + 1}: loss={float(loss):.6g}, "
-                               f"gradient norm={float(norm):.6g}. The step was skipped; state saved to {path}")  # fmt: skip
+            raise RuntimeError(f"{count[1]} consecutive invalid {model} updates; state saved to {path}")
 
     def set_learning_rate(self):
         c = self.cfg
@@ -484,6 +496,7 @@ class Runner:
                         "episode/completed": done, "episode/return_mean": float(episodes[0]) / max(done, 1.0),
                         "episode/length_mean": float(episodes[1]) / max(done, 1.0), "episode/return_normalized": normalized_return,
                         "sim/rejected_transitions": self.rejected_transitions,
+                        **{f"skipped/{model}": count[0] for model, count in self.skipped.items()},
                         "time/iteration_seconds": elapsed / iterations,
                         "time/real_transitions_per_second": iterations * c.collect_steps * c.num_envs / elapsed})  # fmt: skip
                     # The actor's learning-rate boost ends once tracking works or after a fixed budget.

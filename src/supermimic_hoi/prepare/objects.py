@@ -4,7 +4,7 @@ Collision shapes are the ones Weave simulates. Where Weave ships hand-fitted pri
 (``<name>.usda``, used for the clothes stand) those are converted to convex meshes. Every other
 object is a convex decomposition that PhysX computes when it loads Weave's USD; those hulls are
 exported once by ``export_weave_hulls.py`` into ``weave_hulls.npz``. Mass is Weave's density on
-the collision volume.
+the collision volume. ``geometry.npz`` holds the same parts for analytic queries (see geometry.py).
 """
 
 from __future__ import annotations
@@ -129,13 +129,28 @@ def cooked_parts(name: str, part_dir: Path) -> list[Path]:
     return sorted(part_dir.glob("part_*.obj"))
 
 
+def write_geometry(path: Path, names: list[str], parts: list[list]) -> None:
+    """Hull vertices and signed distance grids of every object's convex parts, in registry order."""
+    import torch
+
+    from ..geometry import distance_grid
+
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    grids = [distance_grid([np.asarray(mesh.triangles, dtype=np.float64) for mesh in meshes], device) for meshes in parts]
+    vertices = [np.concatenate([np.asarray(mesh.vertices, dtype=np.float32) for mesh in meshes]) for meshes in parts]
+    most = max(map(len, vertices))
+    padded = np.stack([np.concatenate((v, np.repeat(v[:1], most - len(v), 0))) for v in vertices])
+    np.savez_compressed(path, names=np.array(names), grid=np.stack([g[0] for g in grids]), origin=np.stack([g[1] for g in grids]),
+                        spacing=np.stack([g[2] for g in grids]), vertices=padded)  # fmt: skip
+
+
 def prepare_objects(weave: Path, output: Path, names: list[str]) -> dict:
-    """Write one MJCF per object and ``registry.json``; sorted names define the object keys."""
+    """Write one MJCF per object, ``geometry.npz`` and ``registry.json``; sorted names define the object keys."""
     import mujoco
     import trimesh
 
     output.mkdir(parents=True, exist_ok=True)
-    entries, files = [], {}
+    entries, files, collision = [], {}, []
     values = lambda x: " ".join(f"{v:.12g}" for v in np.asarray(x).flatten())  # noqa: E731
     for name in sorted(set(names)):
         source = Path(weave) / OBJECT_DIR / name / f"{name}.obj"
@@ -146,6 +161,7 @@ def prepare_objects(weave: Path, output: Path, names: list[str]) -> dict:
         visual.parent.mkdir(exist_ok=True)
         shutil.copyfile(source, visual)
         meshes = [trimesh.load(p, force="mesh") for p in parts]
+        collision.append(meshes)
         volumes = np.array([abs(m.volume) for m in meshes])
         mass = float(DENSITY.get(name, DEFAULT_DENSITY) * volumes.sum())
         # Uniform density over the convex parts (overlaps are counted twice, as PhysX does).
@@ -181,6 +197,8 @@ def prepare_objects(weave: Path, output: Path, names: list[str]) -> dict:
         entries.append(dict(name=name, xml=path.name, parts=len(parts), mass=mass,
                             context=[mass, *com.tolist(), *full.tolist(), *FRICTION]))  # fmt: skip
         print(f"Prepared {name}: {len(parts)} convex parts, {mass:.3f} kg", flush=True)
+    write_geometry(output / "geometry.npz", [entry["name"] for entry in entries], collision)
+    files["geometry.npz"] = hashlib.sha256((output / "geometry.npz").read_bytes()).hexdigest()
     registry = dict(format_version=1, objects=entries, context_fields=list(CONTEXT_FIELDS), files=files)
     (output / "registry.json").write_text(json.dumps(registry, indent=2) + "\n")
     return registry

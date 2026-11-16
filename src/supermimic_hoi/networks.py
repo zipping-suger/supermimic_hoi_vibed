@@ -77,18 +77,19 @@ class RunningNorm(nn.Module):
         return (x - self.mean) / self.std()
 
 
-def transition_features(s, u, key, context):
-    """Heading- and position-invariant inputs shared by the world model and the contact-reward head."""
+def transition_features(s, u, key, context, surface):
+    """Heading- and position-invariant inputs shared by the world model and the contact-reward head.
+    ``surface``: the MDP's hand-to-surface features of ``s``."""
     p, R, v, w, q, qd, op, oR, ov, ow = s
     Ht, Rt = yaw_mat(R).transpose(-1, -2), R.transpose(-1, -2)
     return torch.cat((
         p[..., 2:3], mat_to_6d(mm3(Ht, R)), mv3(Rt, v), mv3(Rt, w), q, qd,
         mv3(Ht, op - p), mat_to_6d(mm3(Ht, oR)), mv3(Ht, ov), mv3(oR.transpose(-1, -2), ow),
-        u, key, context), -1)  # fmt: skip
+        u, key, context, surface), -1)  # fmt: skip
 
 
-def feature_dim(J: int, key_dim: int, context_dim: int) -> int:
-    return (13 + 2 * J) + 15 + J + key_dim + context_dim
+def feature_dim(J: int, key_dim: int, context_dim: int, surface_dim: int) -> int:
+    return (13 + 2 * J) + 15 + J + key_dim + context_dim + surface_dim
 
 
 class WorldModel(nn.Module):
@@ -106,10 +107,10 @@ class WorldModel(nn.Module):
     # changing velocity give (n + 1) / (2 n) = 0.625.
     DRIFT_W = 0.625
 
-    def __init__(self, J: int, key_dim: int, context_dim: int, hidden=(1024, 1024, 1024)):
+    def __init__(self, J: int, key_dim: int, context_dim: int, surface_dim: int, hidden=(1024, 1024, 1024)):
         super().__init__()
         self.J = J
-        self.in_dim, self.delta_dim = feature_dim(J, key_dim, context_dim), 24 + 2 * J
+        self.in_dim, self.delta_dim = feature_dim(J, key_dim, context_dim, surface_dim), 24 + 2 * J
         self.net = mlp(self.in_dim, list(hidden), self.delta_dim, act=nn.SiLU, layer_norm=True)
         self.in_norm = RunningNorm(self.in_dim)
         self.out_norm = RunningNorm(self.delta_dim, eps=1e-4)  # scale of the regression targets
@@ -156,9 +157,9 @@ class WorldModel(nn.Module):
         return (p + mv3(H, dp + gp), mm3(R, so3_exp(dth + gth)), v1, w1, q + dq + gq, qd1,
                 op + mv3(H, odp + ogp), mm3(oR, so3_exp(odth + ogth)), ov1, ow1)  # fmt: skip
 
-    def forward(self, s, u, key, context):
+    def forward(self, s, u, key, context, surface):
         """Next state for normalized PD targets ``u``."""
-        out = run_mlp(self.net, self.in_norm(transition_features(s, u, key, context)))
+        out = run_mlp(self.net, self.in_norm(transition_features(s, u, key, context, surface)))
         return self.integrate(s, out * self.out_norm.std() + self.out_norm.mean)
 
     def error(self, predicted, target):
@@ -169,16 +170,16 @@ class WorldModel(nn.Module):
 class ContactRewardHead(nn.Module):
     """Predicts the ten per-finger force scores of the upcoming transition, separately from the dynamics."""
 
-    def __init__(self, J: int, key_dim: int, context_dim: int, hidden=(256, 128)):
+    def __init__(self, J: int, key_dim: int, context_dim: int, surface_dim: int, hidden=(256, 128)):
         super().__init__()
-        dim = feature_dim(J, key_dim, context_dim)
+        dim = feature_dim(J, key_dim, context_dim, surface_dim)
         self.norm = RunningNorm(dim)
         self.net = mlp(dim, list(hidden), 10, act=nn.SiLU, layer_norm=True)
         nn.init.normal_(self.net[-1].weight, std=0.01)
         nn.init.constant_(self.net[-1].bias, -2.0)
 
-    def forward(self, s, u, key, context):
-        return run_mlp(self.net, self.norm(transition_features(s, u, key, context))).sigmoid()
+    def forward(self, s, u, key, context, surface):
+        return run_mlp(self.net, self.norm(transition_features(s, u, key, context, surface))).sigmoid()
 
 
 class Actor(nn.Module):

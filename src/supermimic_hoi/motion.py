@@ -14,6 +14,16 @@ from .robot import FINGERTIPS, FOOT_BODIES, TRACKED_BODIES, Robot, finger_channe
 from .rotations import angular_velocity, central_difference, mat_to_6d, mm3, mv3, quat_to_mat, yaw_mat
 
 CONTROL_DT = 0.02
+ROTATION_LENGTH = 0.15  # metres that one radian of object rotation counts for in an object pose step
+
+
+def pose_step(p0, R0, p1, R1):
+    """(..., 6) change of an object pose over one control step: translation, then the world-frame
+    rotation scaled to a length. The rotation is the antisymmetric part of R1 R0^T (axis times the
+    sine of the angle), which is smooth at rest and within 1 % of the rotation vector for a step."""
+    r = mm3(R1, R0.transpose(-1, -2))
+    turn = torch.stack((r[..., 2, 1] - r[..., 1, 2], r[..., 0, 2] - r[..., 2, 0], r[..., 1, 0] - r[..., 0, 1]), -1) * 0.5
+    return torch.cat((p1 - p0, ROTATION_LENGTH * turn), -1)
 
 
 class Motion:
@@ -68,6 +78,9 @@ class Motion:
         self.object_p, self.object_R = to(arrays["object_pos"]), to(object_R)
         self.object_v = to(per_clip(central_difference, arrays["object_pos"]))
         self.object_w = to(per_clip(angular_velocity, object_R))
+        # Reference object step into every frame; zero into a clip's first frame.
+        before = (torch.arange(self.num_frames, device=device) - 1).clamp_min(self.clip_start[self.clip_id])
+        self.object_step = pose_step(self.object_p[before], self.object_R[before], self.object_p, self.object_R)
 
         # Tracked bodies come first, then the fingertips; rotations and velocities are only
         # needed for the tracked bodies.

@@ -54,6 +54,24 @@ def test_reset_reproduces_the_reference_and_steps_are_consistent(tiny_config):
     assert torch.equal(m.clip_id[env.f], env.env_clip)
 
 
+def test_exploration_noise_is_executed_but_not_recorded(tiny_config):
+    clean, noisy = make_task(tiny_config), make_task(tiny_config)
+    m = clean.motion
+    everyone = torch.ones(4, dtype=torch.bool)
+    frames = m.clip_start[clean.env.env_clip] + 20
+    clean.env.reset(everyone, frames)
+    noisy.env.reset(everyone, frames)
+    action = 0.1 * torch.randn(4, 41)
+    row, noisy_row = clean.env.step(action), noisy.env.step(action, 0.5 * torch.randn(4, 41))
+    # The drives received different targets, yet the recorded action and its costs are the policy's own.
+    assert not torch.allclose(row["u"], noisy_row["u"])
+    assert torch.equal(row["action"], noisy_row["action"]) and torch.equal(clean.env.previous_action, noisy.env.previous_action)
+    for name in ("action_rate", "hand_saturation"):
+        assert torch.equal(row["terms"][name], noisy_row["terms"][name])
+    assert torch.equal(clean.env.history[:, -1, 112:153], noisy.env.history[:, -1, 112:153])
+    assert not torch.equal(clean.env.hand_targets, noisy.env.hand_targets)  # the finger filter follows the drives
+
+
 def test_termination_follows_the_pose_errors_in_simulation_and_imagination(tiny_config):
     task = make_task(tiny_config)
     mdp, m = task.mdp, task.motion

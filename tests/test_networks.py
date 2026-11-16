@@ -36,7 +36,7 @@ def test_running_norm_ignores_an_empty_batch():
 
 def test_world_model_integrate_inverts_targets():
     torch.manual_seed(0)
-    wm = WorldModel(J, key_dim=2, context_dim=3, hidden=(8,)).double()
+    wm = WorldModel(J, key_dim=2, context_dim=3, surface_dim=0, hidden=(8,)).double()
     s, s1 = random_state(16), random_state(16)
     # Keep the step small enough for a unique rotation logarithm.
     s1 = tuple(a + 0.05 * (b - a) if a.shape[-1] != 3 or a.ndim == 2 else a @ so3_exp(0.05 * torch.randn(16, 3, dtype=torch.float64))
@@ -50,13 +50,14 @@ def test_world_model_integrate_inverts_targets():
 
 def test_world_model_starts_as_drift_and_is_differentiable_in_the_action():
     torch.manual_seed(0)
-    wm = WorldModel(J, key_dim=2, context_dim=3, hidden=(8,))
+    wm = WorldModel(J, key_dim=2, context_dim=3, surface_dim=4, hidden=(8,))
     s = tuple(x.float() for x in random_state(4))
     u = torch.randn(4, J, requires_grad=True)
-    s1 = wm(s, u, torch.eye(2)[[0, 1, 0, 1]], torch.zeros(4, 3))
+    surface = torch.randn(4, 4)
+    s1 = wm(s, u, torch.eye(2)[[0, 1, 0, 1]], torch.zeros(4, 3), surface)
     assert torch.allclose(s1[4], s[4] + 0.02 * s[5], atol=1e-5)
     wm.net[-1].weight.data.normal_(std=0.1)
-    wm(s, u, torch.eye(2)[[0, 1, 0, 1]], torch.zeros(4, 3))[0].sum().backward()
+    wm(s, u, torch.eye(2)[[0, 1, 0, 1]], torch.zeros(4, 3), surface)[0].sum().backward()
     assert u.grad.abs().sum() > 0
 
 
