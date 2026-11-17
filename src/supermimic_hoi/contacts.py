@@ -13,15 +13,13 @@ import warp as wp
 from mujoco_warp._src.support import contact_force_fn
 from mujoco_warp._src.types import vec5
 
-from .robot import finger_channel, hand_side
-
 NUM_GROUPS = 12
 
 
 class ContactGroups:
     """Per-geom lookup tables for a compiled scene with ``robot/`` and ``object/`` entities."""
 
-    def __init__(self, model: mujoco.MjModel):
+    def __init__(self, model: mujoco.MjModel, robot):
         self.object_geom = np.zeros(model.ngeom, dtype=np.int32)
         self.hand = np.full(model.ngeom, -1, dtype=np.int32)
         self.finger = np.full(model.ngeom, -1, dtype=np.int32)
@@ -29,8 +27,7 @@ class ContactGroups:
             body = model.body(model.geom_bodyid[geom]).name
             self.object_geom[geom] = body.startswith("object/")
             if body.startswith("robot/"):
-                self.hand[geom] = hand_side(body.removeprefix("robot/"))
-                self.finger[geom] = finger_channel(body.removeprefix("robot/"))
+                self.hand[geom], self.finger[geom] = robot.hand_link(body.removeprefix("robot/"))
 
     def cpu_forces(self, model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
         forces, wrench = np.zeros(NUM_GROUPS), np.zeros(6)

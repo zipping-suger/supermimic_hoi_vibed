@@ -16,8 +16,7 @@ from .motion import CONTROL_DT
 from .rotations import angle_squared, mat_to_6d, mm3, mv3, yaw_mat
 
 FAILURE_REASONS = ("root_position", "root_tilt", "object_position", "object_tilt")
-SURFACE_BODIES = ("left_wrist_yaw_link", "right_wrist_yaw_link")  # followed by the ten fingertips
-SURFACE_DIM = 5 * (len(SURFACE_BODIES) + len(R.FINGERTIPS))
+SURFACE_DIM = 5 * 12  # five features for each of the two palm bodies and ten fingertips
 SURFACE_SCALE = 0.02  # distance [m] on which the surface features resolve the contact band
 
 
@@ -53,13 +52,13 @@ def contact_score(finger_scores, finger_intent):
 class HOIMDP:
     def __init__(self, motion, controller, layout, cfg, noise: bool, geometry):
         self.motion, self.controller, self.layout, self.cfg, self.noisy = motion, controller, layout, cfg, noise
-        self.geometry, self.kin = geometry, motion.kin
+        self.geometry, self.kin, self.robot = geometry, motion.kin, motion.kin.robot
         device = motion.device
         J, A = controller.limits.shape[0], controller.num_body + controller.num_hand
         self.num_tracked = motion.num_tracked
         self.tips = torch.tensor(motion.tips, device=device)
         self.feet = torch.tensor(motion.feet, device=device)
-        self.keypoints = torch.tensor([R.TRACKED_BODIES.index(n) for n in SURFACE_BODIES] + motion.tips, device=device)
+        self.keypoints = torch.tensor([self.robot.tracked_bodies.index(n) for n in self.robot.surface_bodies] + motion.tips, device=device)
         margin = 0.05 * (self.kin.q_hi - self.kin.q_lo)
         self.soft_lo, self.soft_hi = self.kin.q_lo + margin, self.kin.q_hi - margin
         # Uniform noise half-widths on the proprioceptive head of the observation.
@@ -74,7 +73,7 @@ class HOIMDP:
         return self.kin.forward(*s[:6])
 
     def hand_surface(self, s, f, fk=None):
-        """(..., 12, 4): signed distance of both wrists and the ten fingertips to the collision surface
+        """(..., 12, 4): signed distance of both palm bodies and the ten fingertips to the collision surface
         of the object of frame ``f``, and the unit direction away from it in the object frame."""
         body_p = (self.fk(s) if fk is None else fk)[0]
         local = mv3(s[7].transpose(-1, -2).unsqueeze(-3), body_p[..., self.keypoints, :] - s[6].unsqueeze(-2))
@@ -158,7 +157,7 @@ class HOIMDP:
         limits = torch.relu(self.soft_lo - q) + torch.relu(q - self.soft_hi)
         hand_joints = torch.cat((self.controller.driver, self.controller.mimic))
         foot_speed = bv[..., self.feet, :2].square().sum(-1)
-        foot_down = torch.sigmoid((R.FOOT_CONTACT_Z - bp[..., self.feet, 2]) / 0.01)
+        foot_down = torch.sigmoid((self.robot.foot_contact_z - bp[..., self.feet, 2]) / 0.01)
         terms = {
             "body_pos": c.body_pos * torch.exp(-e_pos / c.body_pos_std**2),
             "body_ori": c.body_ori * torch.exp(-e_ori / c.body_ori_std**2),

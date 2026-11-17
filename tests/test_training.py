@@ -98,7 +98,7 @@ def test_train_checkpoint_resume_and_evaluate(tiny_config):
         assert result["completed"] == (result["steps"] == result["reference_steps"] and not result["failure_reasons"])
         assert result["success"] == (result["completed"] and not result["missed_criteria"])
     states = trajectories[tiny_config.clips[0]]
-    assert states.shape == (report["results"][0]["steps"] + 1, 142)
+    assert states.shape == (report["results"][0]["steps"] + 1, 36 + 2 * runner.task.robot.num_joints)
 
 
 def test_checkpoint_rejects_different_physical_assets(tiny_config, tmp_path):

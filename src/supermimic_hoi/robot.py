@@ -1,9 +1,12 @@
-"""Unitree G1 (29 DoF) with two Inspire hands: joint layout, actuation and tracked bodies.
+"""A floating-base humanoid with two five-fingered hands: joint layout, drives and task bodies.
 
-The simulated state has 53 joints in MJCF order. The policy commands 41 of them: 29 body joints
-as residuals on the reference and 12 finger drivers as absolute targets. The other 12 finger
-joints are URDF mimic joints; each follows its driver's target through its own PD drive, as in
-Weave's ``MimicJointPositionAction``.
+Each robot in ``robots/`` is a subclass that names its bodies and supplies three rules: which
+finger joints the policy drives (and which follow a driver), the PD drive of every joint, and the
+hand and finger a link belongs to. Everything else here is derived from the compiled MJCF, so
+kinematics, control, physics and the MDP never mention a particular robot.
+
+The policy commands the body joints as residuals on the reference and the finger drivers as
+absolute targets. Fingers are counted left hand first, thumb to pinky.
 """
 
 from __future__ import annotations
@@ -17,113 +20,87 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-SIDES = ("L", "R")
 FINGERS = ("thumb", "index", "middle", "ring", "pinky")
-FINGER_NAMES = tuple(f"{side}_{finger}" for side in SIDES for finger in FINGERS)
-
-# Policy order of the finger drivers (per hand).
-HAND_DRIVERS = ("thumb_proximal_yaw", "thumb_proximal_pitch", "index_proximal", "middle_proximal",
-                "ring_proximal", "pinky_proximal")  # fmt: skip
-# Mimic joint -> (driver, multiplier), from the URDF <mimic> tags.
-HAND_MIMICS = {
-    "thumb_intermediate": ("thumb_proximal_pitch", 1.6),
-    "thumb_distal": ("thumb_proximal_pitch", 2.4),
-    "index_intermediate": ("index_proximal", 1.0),
-    "middle_intermediate": ("middle_proximal", 1.0),
-    "ring_intermediate": ("ring_proximal", 1.0),
-    "pinky_intermediate": ("pinky_proximal", 1.0),
-}
-
-# Weave's tracked bodies; the first one is the root (anchor).
-TRACKED_BODIES = (
-    "pelvis",
-    "left_hip_pitch_link", "left_knee_link", "left_ankle_roll_link",
-    "right_hip_pitch_link", "right_knee_link", "right_ankle_roll_link",
-    "torso_link",
-    "left_shoulder_roll_link", "left_elbow_link", "left_wrist_yaw_link",
-    "right_shoulder_roll_link", "right_elbow_link", "right_wrist_yaw_link",
-)  # fmt: skip
-FINGERTIPS = tuple(f"{name}_tip" for name in FINGER_NAMES)
-FOOT_BODIES = ("left_ankle_roll_link", "right_ankle_roll_link")
-FOOT_CONTACT_Z = 0.045  # ankle-roll origin height below which a foot counts as on the ground
-
-DEFAULT_JOINT_POS = {
-    ".*_hip_pitch_joint": -0.312,
-    ".*_knee_joint": 0.669,
-    ".*_ankle_pitch_joint": -0.363,
-    ".*_elbow_joint": 0.6,
-    "left_shoulder_roll_joint": 0.2,
-    "left_shoulder_pitch_joint": 0.2,
-    "right_shoulder_roll_joint": -0.2,
-    "right_shoulder_pitch_joint": 0.2,
-}
 
 # Body drives: implicit PD at 10 Hz natural frequency, damping ratio 2, on the reflected rotor
-# inertia (BeyondMimic / Weave). Values are (effort limit [Nm], armature [kg m^2]).
+# inertia (BeyondMimic / Weave). Reflected inertias [kg m^2] of the Unitree actuators.
 NATURAL_FREQ = 10 * 2 * math.pi
 DAMPING_RATIO = 2.0
 ARMATURE_5020 = 0.003609725
 ARMATURE_7520_14 = 0.010177520
 ARMATURE_7520_22 = 0.025101925
 ARMATURE_4010 = 0.00425
-BODY_MOTORS = {
-    "hip_pitch": (88.0, ARMATURE_7520_14),
-    "hip_roll": (139.0, ARMATURE_7520_22),
-    "hip_yaw": (88.0, ARMATURE_7520_14),
-    "knee": (139.0, ARMATURE_7520_22),
-    "ankle_pitch": (50.0, 2 * ARMATURE_5020),
-    "ankle_roll": (50.0, 2 * ARMATURE_5020),
-    "waist_yaw": (88.0, ARMATURE_7520_14),
-    "waist_roll": (50.0, 2 * ARMATURE_5020),
-    "waist_pitch": (50.0, 2 * ARMATURE_5020),
-    "shoulder_pitch": (25.0, ARMATURE_5020),
-    "shoulder_roll": (25.0, ARMATURE_5020),
-    "shoulder_yaw": (25.0, ARMATURE_5020),
-    "elbow": (25.0, ARMATURE_5020),
-    "wrist_roll": (25.0, ARMATURE_5020),
-    "wrist_pitch": (5.0, ARMATURE_4010),
-    "wrist_yaw": (5.0, ARMATURE_4010),
-}
-# Inspire finger drives (Weave): the same PD on drivers and mimic joints.
-FINGER_STIFFNESS, FINGER_DAMPING, FINGER_EFFORT, FINGER_ARMATURE = 5.0, 0.5, 1.0, 0.01
 
-# Domain randomization (the paper's G1 setup) and observation noise half-widths (Table A.1).
+# Domain randomization and observation noise half-widths (BlinkMimic, Table A.1).
 FRICTION_RANGE = (0.3, 1.2)
-COM_BODY = "torso_link"
 COM_RANGE = ((-0.025, 0.025), (-0.05, 0.05), (-0.05, 0.05))
 JOINT_OFFSET = 0.01
 NOISE_JOINT_POS, NOISE_JOINT_VEL, NOISE_ANG_VEL, NOISE_GRAVITY, NOISE_REF_ORI = 0.01, 0.5, 0.2, 0.05, 0.05
 
 
-def is_finger_joint(name: str) -> bool:
-    return name[:2] in ("L_", "R_")
-
-
-def finger_channel(body: str) -> int:
-    """Finger index 0..9 (left then right; thumb..pinky) of a hand link, or -1 (palm, tips, body)."""
-    if body.endswith("_tip"):
-        return -1
-    return next((i for i, name in enumerate(FINGER_NAMES) if body.startswith(name + "_")), -1)
-
-
-def hand_side(body: str) -> int:
-    """0 (left) / 1 (right) for palm and finger links, -1 for everything else."""
-    return SIDES.index(body[0]) if body[:2] in ("L_", "R_") and not body.endswith("_tip") else -1
-
-
-def body_motor(joint: str) -> tuple[float, float]:
-    return BODY_MOTORS[re.sub(r"^(left|right)_", "", joint).removesuffix("_joint")]
-
-
 @dataclass(frozen=True)
-class Robot:
-    """The compiled robot description shared by kinematics, control, physics and the MDP."""
+class Drive:
+    """PD position drive of one joint."""
 
-    asset_dir: Path
+    stiffness: float
+    damping: float
+    effort: float
+    armature: float
+    frictionloss: float | None = None
+    viscous_damping: float | None = None
+
+
+def motor_drive(effort: float, armature: float, **passive) -> Drive:
+    """Body-joint drive from the motor's effort limit [Nm] and reflected inertia."""
+    return Drive(armature * NATURAL_FREQ**2, 2 * DAMPING_RATIO * armature * NATURAL_FREQ, effort, armature, **passive)
+
+
+def side_joint(name: str) -> str:
+    """``left_knee_joint`` -> ``knee``: the key of a per-motor table."""
+    return re.sub(r"^(left|right)_", "", name).removesuffix("_joint")
+
+
+class Robot:
+    name: str
+    mjcf: str  # file name inside the asset directory
+    extra_assets: tuple[str, ...] = ()  # further files in the asset directory that define the robot
+    tracked_bodies: tuple[str, ...]  # bodies whose poses are tracked; the first one is the root
+    fingertips: tuple[str, ...]  # ten fingertip frames
+    surface_bodies: tuple[str, str]  # tracked bodies that stand for the left and right palm
+    foot_bodies: tuple[str, str]
+    foot_contact_z: float  # height of a foot body's origin below which the foot counts as on the ground
+    com_body: str  # body whose centre of mass is randomized
+    root_height: float
+    default_pose: dict[str, float]  # joint-name pattern -> default position; unmatched joints are 0
+
+    def __init__(self, asset_dir: str | Path):
+        self.asset_dir = Path(asset_dir)
+
+    # Rules a robot supplies.
+
+    @property
+    def driver_joint_names(self) -> tuple[str, ...]:
+        """Finger joints the policy commands, in action order."""
+        raise NotImplementedError
+
+    @property
+    def mimics(self) -> dict[str, tuple[str, float]]:
+        """Finger joint -> (driver joint, ratio): its target is the ratio times the driver's target."""
+        raise NotImplementedError
+
+    def drive(self, joint: str) -> Drive:
+        raise NotImplementedError
+
+    def hand_link(self, body: str) -> tuple[int, int]:
+        """(hand, finger) of a link: hand 0 (left) / 1 (right) for palm and finger links, finger 0..9
+        for finger links; -1 where it does not apply (the body, fingertip frames, a palm's finger)."""
+        raise NotImplementedError
+
+    # Derived layout.
 
     @property
     def mjcf_path(self) -> Path:
-        return Path(self.asset_dir) / "g1_inspire.xml"
+        return self.asset_dir / self.mjcf
 
     @cached_property
     def model(self) -> mujoco.MjModel:
@@ -141,16 +118,16 @@ class Robot:
         return len(self.joint_names)
 
     @cached_property
-    def body_joint_names(self) -> tuple[str, ...]:
-        return tuple(n for n in self.joint_names if not is_finger_joint(n))
-
-    @cached_property
-    def driver_joint_names(self) -> tuple[str, ...]:
-        return tuple(f"{side}_{name}_joint" for side in SIDES for name in HAND_DRIVERS)
-
-    @cached_property
     def mimic_joint_names(self) -> tuple[str, ...]:
-        return tuple(f"{side}_{name}_joint" for side in SIDES for name in HAND_MIMICS)
+        return tuple(self.mimics)
+
+    @cached_property
+    def hand_joint_names(self) -> frozenset[str]:
+        return frozenset(self.driver_joint_names + self.mimic_joint_names)
+
+    @cached_property
+    def body_joint_names(self) -> tuple[str, ...]:
+        return tuple(n for n in self.joint_names if n not in self.hand_joint_names)
 
     def indices(self, names) -> list[int]:
         return [self.joint_names.index(n) for n in names]
@@ -169,13 +146,12 @@ class Robot:
 
     @cached_property
     def mimic_driver(self) -> list[int]:
-        """For every mimic joint, the position of its driver in the 12 driver commands."""
-        return [self.driver_joint_names.index(f"{side}_{HAND_MIMICS[name][0]}_joint")
-                for side in SIDES for name in HAND_MIMICS]  # fmt: skip
+        """For every mimic joint, the position of its driver among the driver commands."""
+        return [self.driver_joint_names.index(driver) for driver, _ in self.mimics.values()]
 
     @cached_property
     def mimic_ratio(self) -> list[float]:
-        return [HAND_MIMICS[name][1] for _ in SIDES for name in HAND_MIMICS]
+        return [ratio for _, ratio in self.mimics.values()]
 
     @property
     def num_actions(self) -> int:
@@ -191,7 +167,7 @@ class Robot:
     def default_joint_pos(self) -> np.ndarray:
         q = np.zeros(self.num_joints, dtype=np.float32)
         for i, name in enumerate(self.joint_names):
-            for pattern, value in DEFAULT_JOINT_POS.items():
+            for pattern, value in self.default_pose.items():
                 if re.fullmatch(pattern, name):
                     q[i] = value
         return q
@@ -200,20 +176,20 @@ class Robot:
     def control_center(self) -> np.ndarray:
         """Per-joint zero of the normalized PD target: default pose (body), mid-range (fingers)."""
         mid = self.joint_limits.mean(-1)
-        return np.where([is_finger_joint(n) for n in self.joint_names], mid, self.default_joint_pos).astype(np.float32)
+        return np.where([n in self.hand_joint_names for n in self.joint_names], mid, self.default_joint_pos).astype(np.float32)
 
     @cached_property
     def control_scale(self) -> np.ndarray:
         """Radians per unit of normalized PD target: 0.25 effort / kp (body), half-range (fingers)."""
         half = (self.joint_limits[:, 1] - self.joint_limits[:, 0]) / 2
-        scale = [half[i] if is_finger_joint(n) else 0.25 * body_motor(n)[0] / (body_motor(n)[1] * NATURAL_FREQ**2)
+        scale = [half[i] if n in self.hand_joint_names else 0.25 * self.drive(n).effort / self.drive(n).stiffness
                  for i, n in enumerate(self.joint_names)]  # fmt: skip
         return np.asarray(scale, dtype=np.float32)
 
     @property
-    def tracked_bodies(self) -> tuple[str, ...]:
-        """Bodies whose FK the MDP needs: the tracking set followed by the ten fingertips."""
-        return TRACKED_BODIES + FINGERTIPS
+    def fk_bodies(self) -> tuple[str, ...]:
+        """Bodies whose FK the MDP needs: the tracked bodies followed by the ten fingertips."""
+        return self.tracked_bodies + self.fingertips
 
     def entity_cfg(self):
         from mjlab.actuator import BuiltinPositionActuatorCfg
@@ -221,15 +197,12 @@ class Robot:
 
         actuators = []
         for name in self.joint_names:
-            if is_finger_joint(name):
-                kp, kd, effort, armature = FINGER_STIFFNESS, FINGER_DAMPING, FINGER_EFFORT, FINGER_ARMATURE
-            else:
-                effort, armature = body_motor(name)
-                kp, kd = armature * NATURAL_FREQ**2, 2 * DAMPING_RATIO * armature * NATURAL_FREQ
+            d = self.drive(name)
             actuators.append(BuiltinPositionActuatorCfg(
-                target_names_expr=(name,), stiffness=kp, damping=kd, effort_limit=effort, armature=armature))  # fmt: skip
+                target_names_expr=(name,), stiffness=d.stiffness, damping=d.damping, effort_limit=d.effort,
+                armature=d.armature, frictionloss=d.frictionloss, viscous_damping=d.viscous_damping))  # fmt: skip
         return EntityCfg(
-            init_state=EntityCfg.InitialStateCfg(pos=(0.0, 0.0, 0.76), joint_pos=DEFAULT_JOINT_POS, joint_vel={".*": 0.0}),
+            init_state=EntityCfg.InitialStateCfg(pos=(0.0, 0.0, self.root_height), joint_pos=self.default_pose, joint_vel={".*": 0.0}),
             spec_fn=lambda: mujoco.MjSpec.from_file(str(self.mjcf_path)),
             articulation=EntityArticulationInfoCfg(actuators=tuple(actuators), soft_joint_pos_limit_factor=0.9),
         )

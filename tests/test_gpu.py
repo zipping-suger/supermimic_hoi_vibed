@@ -18,7 +18,7 @@ def gpu(config, **changes):
 
 def test_warp_matches_cpu_physics_and_resets_only_masked_worlds(tiny_config):
     cpu, warp = make_task(tiny_config), make_task(gpu(tiny_config))
-    frames = cpu.motion.clip_start[cpu.env.env_clip] + torch.tensor([0, 30, 60, 90])
+    frames = cpu.motion.clip_start[torch.tensor([0, 0, 1, 1])] + torch.tensor([0, 30, 60, 90])
     everyone = torch.ones(4, dtype=torch.bool)
     cpu.env.reset(everyone, frames)
     warp.env.reset(everyone.cuda(), frames.cuda())
@@ -44,15 +44,16 @@ def test_warp_matches_cpu_physics_and_resets_only_masked_worlds(tiny_config):
 def test_an_excursion_is_rejected_contained_and_reset(tiny_config):
     task = make_task(gpu(tiny_config, max_joint_speed=1e-3))  # every moving world violates this limit
     env = task.env
-    row = env.step(torch.zeros(4, 41, device="cuda:0"))
+    row = env.step(torch.zeros(4, task.robot.num_actions, device="cuda:0"))
     assert not bool(row["valid"].any()) and bool(row["term"].all()) and float(row["reward"].abs().sum()) == 0
     assert env.physics.check() == 4 and bool(env.physics.ok)
     assert torch.isfinite(pack(env.physics.state())).all()
 
 
 def test_a_nonfinite_target_is_fatal(tiny_config):
-    env = make_task(gpu(tiny_config)).env
-    action = torch.zeros(4, 41, device="cuda:0")
+    task = make_task(gpu(tiny_config))
+    env = task.env
+    action = torch.zeros(4, task.robot.num_actions, device="cuda:0")
     action[2, 0] = float("nan")
     row = env.step(action)
     assert row["valid"].tolist() == [True, True, False, True] and not bool(env.physics.ok)
@@ -77,3 +78,25 @@ def test_training_with_randomization_and_cuda_graphs(tiny_config):
     for model in (runner.wm, runner.actor, runner.critic, runner.reward_head, runner.ema, runner.target_critic):
         assert all(torch.isfinite(p).all() for p in model.parameters())
     assert float(runner.wm.in_norm.count) == calls["_collect"].calls * config.num_envs
+
+
+def test_a_world_that_takes_another_object_matches_the_worlds_built_with_it(tiny_config):
+    task = make_task(gpu(tiny_config))
+    env, m = task.env, task.motion
+    everyone = torch.ones(4, dtype=torch.bool, device="cuda:0")
+    body = env.physics.sim.mj_model.body("object/object").id
+    # Two worlds were built with each object, so in every round two of them hold an object they took at a reset.
+    for clip in (0, 1, 0):
+        touching = (m.clip_id == clip) & (m.hand_intent(torch.arange(m.num_frames, device="cuda:0")).sum(-1) > 0)
+        frames = env.reset_map[touching.nonzero()[0]].expand(4)
+        env.reset(everyone, frames)
+        entry = task.registry["objects"][int(m.clip_object[clip])]
+        assert torch.allclose(env.physics.sim.model.body_mass[:, body], torch.full((4,), entry["mass"], device="cuda:0"))
+        assert torch.allclose(env.context[:, :13], torch.tensor(entry["context"], device="cuda:0").expand(4, 13))
+        for _ in range(3):
+            row = env.step(task.controller.reference_action(m.q[m.next_frame(env.f)]))
+            assert env.physics.check() == 0 and bool(row["valid"].all())
+        # Same object, state and targets: the worlds agree up to the order in which contacts are summed,
+        # which moves contact velocities by a few 1e-3. A world left with the other object differs by more than 1.
+        s = pack(env.physics.state())
+        assert (s - s[:1]).abs().max() < 5e-2

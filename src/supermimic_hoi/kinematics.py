@@ -16,7 +16,7 @@ from .rotations import axis_angle_to_mat, mm3, mv3, quat_to_mat
 
 class Kinematics:
     def __init__(self, robot: Robot, device: str = "cpu", bodies: tuple[str, ...] | None = None):
-        """``bodies``: output bodies in order (default: ``robot.tracked_bodies``)."""
+        """``bodies``: output bodies in order (default: ``robot.fk_bodies``)."""
         m = robot.model
         joint_of = {n: i for i, n in enumerate(robot.joint_names)}
         names, parent, joint, axes, anchors, offsets_p, offsets_q = [], [], [], [], [], [], []
@@ -44,7 +44,7 @@ class Kinematics:
         self.body_names, self.parent, self.joint = names, parent, joint
         self.axes, self.anchors, self.off_p = as_tensor(axes), as_tensor(anchors), as_tensor(offsets_p)
         self.off_R = quat_to_mat(as_tensor(offsets_q))
-        self.output = [names.index(n) for n in (robot.tracked_bodies if bodies is None else bodies)]
+        self.output = [names.index(n) for n in (robot.fk_bodies if bodies is None else bodies)]
         needed = set()
         for body in self.output:
             while body >= 0:

@@ -42,10 +42,11 @@ def load_registry(folder: str | Path) -> tuple[dict, str]:
 
 
 def robot_signature(robot) -> str:
-    """Fingerprint of the robot MJCF and the meshes it references."""
+    """Fingerprint of the robot MJCF, the meshes it references and its other asset files."""
     digest = hashlib.sha256(robot.mjcf_path.read_bytes())
-    for mesh in sorted((Path(robot.asset_dir) / "meshes").iterdir()):
-        digest.update(hashlib.sha256(mesh.read_bytes()).digest())
+    meshes = sorted(path for path in (robot.asset_dir / "meshes").rglob("*") if path.is_file())
+    for file in (*meshes, *(robot.asset_dir / name for name in robot.extra_assets)):
+        digest.update(hashlib.sha256(file.read_bytes()).digest())
     return digest.hexdigest()
 
 
@@ -146,19 +147,21 @@ def numerical_status(qpos, qvel, idx: Indexing, cfg):
 class CPUPhysics:
     """One MuJoCo model per object and one MjData per world. Deterministic; for tests and audits."""
 
-    def __init__(self, robot, registry, folder, assignment: list[int], cfg):
-        self.cfg, self.device, self.N = cfg, "cpu", len(assignment)
-        self.assignment = list(assignment)
+    def __init__(self, robot, registry, folder, objects: list[int], num_envs: int, cfg):
+        """``objects``: registry indices of the objects the worlds may hold."""
+        self.cfg, self.device, self.N = cfg, "cpu", num_envs
         self.models, self.indices, self.groups = {}, {}, {}
         sim_cfg = simulation_cfg(cfg.nconmax, cfg.njmax)
-        for k in sorted(set(assignment)):
+        for k in objects:
             model = make_scene(robot, registry, folder, [k], 1, "cpu").compile()
             sim_cfg.mujoco.apply(model)
-            self.groups[k] = ContactGroups(model)
+            self.groups[k] = ContactGroups(model, robot)
             model.geom_friction[~self.groups[k].object_geom.astype(bool), 0] = 1.0  # robot and ground
             self.models[k], self.indices[k] = model, Indexing(model, robot)
-        self.data = [mujoco.MjData(self.models[k]) for k in assignment]
-        self.object_context = torch.tensor([registry["objects"][k]["context"] for k in assignment], dtype=torch.float32)
+        self.contexts = {k: torch.tensor(registry["objects"][k]["context"], dtype=torch.float32) for k in objects}
+        self.assignment = [objects[e % len(objects)] for e in range(num_envs)]
+        self.data = [mujoco.MjData(self.models[k]) for k in self.assignment]
+        self.object_context = torch.stack([self.contexts[k] for k in self.assignment])
         self.hand_force, self.finger_force = torch.zeros(self.N, 2), torch.zeros(self.N, 10)
 
     def state(self):
@@ -166,9 +169,12 @@ class CPUPhysics:
                   for k, d in zip(self.assignment, self.data)]  # fmt: skip
         return tuple(torch.stack([s[i] for s in states]) for i in range(10))
 
-    def reset(self, mask, state):
+    def reset(self, mask, state, objects):
         for e in mask.nonzero().flatten().tolist():
-            k, d = self.assignment[e], self.data[e]
+            k = int(objects[e])
+            if k != self.assignment[e]:
+                self.assignment[e], self.data[e], self.object_context[e] = k, mujoco.MjData(self.models[k]), self.contexts[k]
+            d = self.data[e]
             mujoco.mj_resetData(self.models[k], d)
             encode(tuple(x[e].double() for x in state), torch.from_numpy(d.qpos), torch.from_numpy(d.qvel), self.indices[k])
             d.ctrl[self.indices[k].ctrl] = state[4][e].numpy()
@@ -201,16 +207,20 @@ class CPUPhysics:
 
 
 class WarpPhysics:
-    """Batched MuJoCo-Warp worlds with per-world object variants.
+    """Batched MuJoCo-Warp worlds, each holding one object that a reset may exchange.
 
-    Every method is fixed-shape and free of host synchronization, so a whole control step can be
+    All worlds share one compiled structure; an object is a set of per-world rows (its meshes, their
+    frames and bounds, the body's inertial). A reset writes the rows of the new object, which costs
+    no memory and no extra simulation time. Every method is fixed-shape and free of host synchronization, so a whole control step can be
     captured in a CUDA graph. Invalid worlds are detected at the first bad substep and restored to
     their last valid state, which keeps the remaining kernels safe; ``step`` reports them as
     invalid and ``check`` (host side, after the step) raises on fatal faults.
     """
 
-    def __init__(self, robot, registry, folder, assignment: list[int], cfg):
+    def __init__(self, robot, registry, folder, objects: list[int], num_envs: int, cfg):
+        """``objects``: registry indices of the objects the worlds may hold."""
         import warp as wp
+        from mjlab.entity.variants import VARIANT_DEPENDENT_FIELDS
         from mjlab.sim import Simulation
 
         from .variant_collision import filter_empty_variant_meshes
@@ -218,9 +228,10 @@ class WarpPhysics:
         if not torch.cuda.is_available():
             raise RuntimeError("The MuJoCo-Warp backend needs CUDA; use backend='cpu' with device='cpu' for tests")
         wp.config.quiet = True
-        self.cfg, self.device, self.N = cfg, cfg.device, len(assignment)
-        objects = sorted(set(assignment))
-        local = [objects.index(k) for k in assignment]
+        self.cfg, self.device, self.N = cfg, cfg.device, num_envs
+        if num_envs < len(objects):
+            raise ValueError(f"num_envs must be at least the number of objects ({len(objects)})")
+        local = [e % len(objects) for e in range(num_envs)]  # every object is built into some world
         scene = make_scene(robot, registry, folder, objects, self.N, cfg.device, local)
         self.sim = Simulation(num_envs=self.N, cfg=simulation_cfg(cfg.nconmax, cfg.njmax), spec=scene.spec,
                               variant_info=scene.collect_variant_info(), device=cfg.device)  # fmt: skip
@@ -231,14 +242,30 @@ class WarpPhysics:
             self.sim.wp_data.naccdmax = cfg.nccdmax * self.N  # convex-collision workspace only
         self.sim.create_graph()
         self.idx = Indexing(self.sim.mj_model, robot).to(cfg.device)
-        self.object_context = torch.tensor([registry["objects"][k]["context"] for k in assignment], device=cfg.device)
+        # The rows that make a world's object what it is, read from a world built with each object.
+        model = self.sim.mj_model
+        body = model.body("object/object").id
+        geoms = torch.tensor(np.flatnonzero(model.geom_bodyid == body), device=cfg.device)
+        built = torch.tensor([local.index(v) for v in range(len(objects))], device=cfg.device)
+        self._object_rows = []
+        for name in ("geom_dataid", "geom_matid", *VARIANT_DEPENDENT_FIELDS):
+            # The world body's subtree mass includes the object.
+            bodies = [0, body] if name == "body_subtreemass" else [body]
+            columns = geoms if name.startswith("geom_") else torch.tensor(bodies, device=cfg.device)
+            rows = wp.to_torch(getattr(self.sim.wp_model, name))
+            self._object_rows.append((rows, columns, rows[built][:, columns].clone()))
+        self._contexts = torch.tensor([registry["objects"][k]["context"] for k in objects], device=cfg.device)
+        self._position = torch.full((len(registry["objects"]),), -1, device=cfg.device)  # registry index -> row of the tables
+        self._position[torch.tensor(objects, device=cfg.device)] = torch.arange(len(objects), device=cfg.device)
+        self.held = torch.tensor(local, device=cfg.device)  # table row of the object every world holds
+        self.object_context = self._contexts[self.held].clone()
 
         data = self.sim.wp_data
         self.tensors = {name: wp.to_torch(getattr(data, name)) for name in ("qpos", "qvel", "qacc_warmstart", "ctrl", "time")}
         self._counts = [wp.to_torch(x) for x in (data.ncollision, data.nacon, data.nefc)]
         self._overflow = wp.to_torch(data.overflow)
         self._row_adr, self._row_nnz = wp.to_torch(data.efc.J_rowadr), wp.to_torch(data.efc.J_rownnz)
-        groups = ContactGroups(self.sim.mj_model)
+        groups = ContactGroups(self.sim.mj_model, robot)
         self._groups = [wp.array(x, dtype=wp.int32, device=cfg.device) for x in (groups.object_geom, groups.hand, groups.finger)]
         self._force_step = torch.zeros(self.N, NUM_GROUPS, device=cfg.device)
         self._force_wp = wp.from_torch(self._force_step)
@@ -282,12 +309,17 @@ class WarpPhysics:
             valid = valid & ((nefc == 0) | (nnz <= data.njmax_nnz)).all()
         self._reject(~valid.expand(self.N), CAPACITY)
 
-    def reset(self, mask, state):
-        """Set the worlds where ``mask`` is true to ``state``; the others keep theirs."""
+    def reset(self, mask, state, objects):
+        """Set the worlds where ``mask`` is true to ``state`` and give them the objects ``objects`` (N,)
+        (registry indices); the others keep theirs."""
         import mujoco_warp as mjwarp
         import warp as wp
 
         sim = self.sim
+        self.held.copy_(torch.where(mask, self._position[objects], self.held))
+        for rows, columns, table in self._object_rows:
+            rows[:, columns] = table[self.held]
+        self.object_context.copy_(self._contexts[self.held])
         wp.to_torch(sim._reset_mask_wp).copy_(mask)
         with wp.ScopedDevice(sim.wp_device):
             if sim.use_cuda_graph and sim.reset_graph is not None:

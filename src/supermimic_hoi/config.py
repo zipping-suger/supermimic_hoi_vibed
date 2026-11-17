@@ -69,7 +69,7 @@ class TrainConfig:
     object_assets: str = "data/objects"
     clips: list[str] = field(default_factory=list)  # empty: every clip of the dataset
 
-    # Simulation. Every clip owns num_envs / num_clips worlds.
+    # Simulation. A world draws a clip at every reset; num_envs is at least the number of objects.
     device: str = "cuda:0"
     backend: str = "warp"
     num_envs: int = 600

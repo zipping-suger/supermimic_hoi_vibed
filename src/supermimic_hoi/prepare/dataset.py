@@ -1,6 +1,7 @@
-"""Sample Weave clips into one compact archive in this repository's joint order.
+"""Reference clips as one compact archive in the robot's joint order.
 
-A split is a folder of Weave archives under ``data/``: the kinematic references (``test``) or the
+``write_dataset`` stores the clips that training reads. The rest of this module samples them from
+Weave. A split is a folder of Weave archives under ``data/``: the kinematic references (``test``) or the
 trajectories Weave's policy executed in simulation for the same clips (``rollout/test``). Both
 have the same fields; a rollout is named after its reference clip with ROLLOUT_SUFFIX appended.
 """
@@ -62,13 +63,34 @@ def select_clips(names, valid, quota: int, rng) -> list[int]:
     return sorted(chosen)
 
 
-def prepare_dataset(weave: Path, output: Path, robot, split: str = "test", count: int = 600, seed: int = 0) -> dict:
-    """Write ``motion.npz`` and ``manifest.json`` with an object-balanced, seeded clip sample.
+def write_dataset(output: Path, robot, clips: list[dict], label_bodies, manifest: dict) -> dict:
+    """Write ``motion.npz`` and ``manifest.json``.
 
-    Stored per frame: pelvis pose, joint positions in ``robot.joint_names`` order, object pose and
-    Weave's per-body contact labels (references: +1 contact, 0 neutral, -1 separated; rollouts: 1
-    where the measured contact force exceeds 1 N, else 0). Velocities and body poses are recomputed
-    at load time, so the archive stays small and self-consistent. Clips keep their reference names.
+    Every clip gives its ``name``, ``object`` and per frame: root pose (``root_pos``, ``root_quat``),
+    ``joint_pos`` in ``robot.joint_names`` order, object pose (``object_pos``, ``object_quat``) and a
+    ``contact_label`` per body of ``label_bodies`` (positive: in contact with the object).
+    Velocities and body poses are recomputed at load time, so the archive stays small and
+    self-consistent. ``manifest`` holds the entries that describe the source.
+    """
+    keys = ("root_pos", "root_quat", "joint_pos", "object_pos", "object_quat", "contact_label")
+    names, lengths = [clip["name"] for clip in clips], [len(clip["joint_pos"]) for clip in clips]
+    output.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output / "motion.npz", **{k: np.concatenate([clip[k] for clip in clips]) for k in keys},
+        clip_names=np.array(names), clip_objects=np.array([clip["object"] for clip in clips]), clip_lengths=np.array(lengths),
+        joint_names=np.array(robot.joint_names), label_bodies=np.array(label_bodies), fps=np.array(50))  # fmt: skip
+    frames = sum(lengths)
+    manifest = dict(format_version=1, **manifest, clips=len(clips), frames=frames, hours=frames / 50 / 3600)
+    manifest = dict(manifest, motion_sha256=hashlib.sha256((output / "motion.npz").read_bytes()).hexdigest(), clip_names=names)
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
+def prepare_dataset(weave: Path, output: Path, robot, split: str = "test", count: int = 600, seed: int = 0) -> dict:
+    """An object-balanced, seeded sample of Weave clips, under their reference names.
+
+    Contact labels are Weave's (references: +1 contact, 0 neutral, -1 separated; rollouts: 1 where
+    the measured contact force exceeds 1 N, else 0).
     """
     import torch
 
@@ -87,8 +109,7 @@ def prepare_dataset(weave: Path, output: Path, robot, split: str = "test", count
     order = [isaac_joints.index(n) for n in robot.joint_names]
     kin = Kinematics(robot, bodies=ISAAC_BODIES)
     lo, hi = robot.joint_limits.T
-    out = {k: [] for k in ("root_pos", "root_quat", "joint_pos", "object_pos", "object_quat", "contact_label")}
-    clip_names, clip_objects, lengths, sources, per_object, rejected = [], [], [], {}, {}, []
+    selected, sources, per_object, rejected = [], {}, {}, []
     fk_error, limit_excess = 0.0, 0.0
     for index, file in enumerate(files):
         with np.load(file, allow_pickle=False) as data:
@@ -116,24 +137,13 @@ def prepare_dataset(weave: Path, output: Path, robot, split: str = "test", count
                              torch.from_numpy(q), torch.zeros(len(q), robot.num_joints))[0]  # fmt: skip
             fk_error = max(fk_error, float((fk - torch.from_numpy(arrays["body_pos_w"][rows])).norm(dim=-1).max()))
             limit_excess = max(limit_excess, float(excess[rows].max()))
-            out["root_pos"].append(root_pos), out["root_quat"].append(root_quat), out["joint_pos"].append(q)
-            out["object_pos"].append(arrays["object_pos_w"][rows])
-            out["object_quat"].append(arrays["object_quat_w"][rows])
-            out["contact_label"].append(arrays["contact_label"][rows].astype(np.int8))
-            clip_names.append(str(clips[clip])), clip_objects.append(name), lengths.append(len(q))
+            selected.append(dict(
+                name=str(clips[clip]), object=name, root_pos=root_pos, root_quat=root_quat, joint_pos=q,
+                object_pos=arrays["object_pos_w"][rows], object_quat=arrays["object_quat_w"][rows],
+                contact_label=arrays["contact_label"][rows].astype(np.int8)))  # fmt: skip
     if fk_error > 2e-3:
         raise ValueError(f"FK disagrees with the recorded body positions by {fk_error:.4f} m")
 
-    output.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output / "motion.npz", **{k: np.concatenate(v) for k, v in out.items()},
-        clip_names=np.array(clip_names), clip_objects=np.array(clip_objects), clip_lengths=np.array(lengths),
-        joint_names=np.array(robot.joint_names), label_bodies=np.array(ISAAC_BODIES), fps=np.array(50))  # fmt: skip
-    manifest = dict(
-        format_version=1, source="Weave motions (appolyn/Weave)", split=split, seed=seed,
-        clips=len(clip_names), frames=int(sum(lengths)), hours=sum(lengths) / 50 / 3600,
-        per_object=per_object, source_sha256=sources, rejected_clips=rejected,
-        fk_max_error_m=fk_error, joint_limit_max_excess_rad=max(limit_excess, 0.0),
-        motion_sha256=hashlib.sha256((output / "motion.npz").read_bytes()).hexdigest(), clip_names=clip_names)  # fmt: skip
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    return manifest
+    return write_dataset(output, robot, selected, ISAAC_BODIES, dict(
+        source="Weave motions (appolyn/Weave)", split=split, seed=seed, per_object=per_object, source_sha256=sources,
+        rejected_clips=rejected, fk_max_error_m=fk_error, joint_limit_max_excess_rad=max(limit_excess, 0.0)))  # fmt: skip

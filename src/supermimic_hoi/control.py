@@ -1,8 +1,8 @@
 """Policy actions -> joint PD targets.
 
 Body joints follow the next reference pose plus a scaled residual. Finger drivers take absolute
-commands in [-1, 1] mapped onto their joint limits and low-pass filtered; the mimic joints follow
-their driver's filtered target. Action order is body[29] then finger drivers[12].
+commands in [-1, 1] mapped onto their joint limits and low-pass filtered; mimic joints follow
+their driver's filtered target. Action order is the body joints, then the finger drivers.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ class Controller(nn.Module):
         return torch.cat((torch.zeros_like(qref_next[..., self.body]), hand.clamp(-1, 1)), -1)
 
     def forward(self, action, qref_next, hand_targets, offset):
-        """PD targets (..., J) and the new finger filter state (..., 12).
+        """PD targets (..., J) and the new finger filter state (..., drivers).
 
         ``action`` must already be bounded. ``offset`` is the per-joint encoder offset: the policy
         observes q - offset, so every target moves by +offset.

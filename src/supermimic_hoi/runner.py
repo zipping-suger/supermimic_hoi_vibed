@@ -43,7 +43,7 @@ class Runner:
 
         self.task = make_task(cfg)
         self.motion, self.control, self.mdp, self.env = self.task.motion, self.task.controller, self.task.mdp, self.task.env
-        self.replay = Replay(cfg.buffer_steps, cfg.num_envs, len(self.motion.names), cfg.device)
+        self.replay = Replay(cfg.buffer_steps, cfg.num_envs, cfg.device)
 
         env, J = self.env, self.task.robot.num_joints
         key_dim, context_dim = len(self.motion.object_names), env.context.shape[-1]

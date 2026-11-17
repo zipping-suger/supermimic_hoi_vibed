@@ -1,5 +1,7 @@
-"""Convex collision assets and explicit inertials for Weave's objects.
+"""Convex collision assets and explicit inertials of the objects.
 
+``write_objects`` turns convex parts and an inertial into the MJCF, registry and distance fields
+that training reads. The rest of this module builds those inputs for Weave's objects.
 Collision shapes are the ones Weave simulates. Where Weave ships hand-fitted primitive colliders
 (``<name>.usda``, used for the clothes stand) those are converted to convex meshes. Every other
 object is a convex decomposition that PhysX computes when it loads Weave's USD; those hulls are
@@ -144,34 +146,32 @@ def write_geometry(path: Path, names: list[str], parts: list[list]) -> None:
                         spacing=np.stack([g[2] for g in grids]), vertices=padded)  # fmt: skip
 
 
-def prepare_objects(weave: Path, output: Path, names: list[str]) -> dict:
-    """Write one MJCF per object, ``geometry.npz`` and ``registry.json``; sorted names define the object keys."""
+def uniform_density_inertial(meshes: list, mass: float):
+    """Centre of mass and inertia tensor of ``mass`` spread uniformly over convex parts (overlaps are
+    counted twice, as PhysX does)."""
+    volumes = np.array([abs(m.volume) for m in meshes])
+    weights = volumes / volumes.sum() * mass
+    com = sum(w * m.center_mass for w, m in zip(weights, meshes)) / mass
+    inertia = np.zeros((3, 3))
+    for weight, mesh, volume in zip(weights, meshes, volumes):
+        d = mesh.center_mass - com
+        inertia += mesh.moment_inertia * weight / volume + weight * (np.dot(d, d) * np.eye(3) - np.outer(d, d))
+    return com, inertia
+
+
+def write_objects(output: Path, objects: list[dict]) -> dict:
+    """Write one MJCF per object, ``geometry.npz`` and ``registry.json``; the order of ``objects``
+    defines the object keys. Each object gives its ``name``, convex ``parts`` and ``visual`` mesh
+    (files under ``output``, in the object's body frame), ``mass``, ``com`` and ``inertia`` (3x3)."""
     import mujoco
     import trimesh
 
-    output.mkdir(parents=True, exist_ok=True)
     entries, files, collision = [], {}, []
     values = lambda x: " ".join(f"{v:.12g}" for v in np.asarray(x).flatten())  # noqa: E731
-    for name in sorted(set(names)):
-        source = Path(weave) / OBJECT_DIR / name / f"{name}.obj"
-        primitives = source.with_suffix(".usda")
-        part_dir = output / "parts" / name
-        parts = primitive_parts(primitives, part_dir) if primitives.is_file() else cooked_parts(name, part_dir)
-        visual = output / "visual" / f"{name}.obj"
-        visual.parent.mkdir(exist_ok=True)
-        shutil.copyfile(source, visual)
-        meshes = [trimesh.load(p, force="mesh") for p in parts]
-        collision.append(meshes)
-        volumes = np.array([abs(m.volume) for m in meshes])
-        mass = float(DENSITY.get(name, DEFAULT_DENSITY) * volumes.sum())
-        # Uniform density over the convex parts (overlaps are counted twice, as PhysX does).
-        weights = volumes / volumes.sum() * mass
-        com = sum(w * m.center_mass for w, m in zip(weights, meshes)) / mass
-        inertia = np.zeros((3, 3))
-        for weight, mesh, volume in zip(weights, meshes, volumes):
-            d = mesh.center_mass - com
-            inertia += mesh.moment_inertia * weight / volume + weight * (np.dot(d, d) * np.eye(3) - np.outer(d, d))
-        full = inertia[[0, 1, 2, 0, 0, 1], [0, 1, 2, 1, 2, 2]]
+    for obj in objects:
+        name, parts, visual, mass, com = obj["name"], obj["parts"], obj["visual"], obj["mass"], np.asarray(obj["com"])
+        collision.append([trimesh.load(p, force="mesh") for p in parts])
+        full = np.asarray(obj["inertia"])[[0, 1, 2, 0, 0, 1], [0, 1, 2, 1, 2, 2]]
 
         xml = ET.Element("mujoco", model=name)
         ET.SubElement(xml, "compiler", angle="radian", inertiafromgeom="false")
@@ -202,3 +202,24 @@ def prepare_objects(weave: Path, output: Path, names: list[str]) -> dict:
     registry = dict(format_version=1, objects=entries, context_fields=list(CONTEXT_FIELDS), files=files)
     (output / "registry.json").write_text(json.dumps(registry, indent=2) + "\n")
     return registry
+
+
+def prepare_objects(weave: Path, output: Path, names: list[str]) -> dict:
+    """Collision assets of Weave's objects; sorted names define the object keys."""
+    import trimesh
+
+    output.mkdir(parents=True, exist_ok=True)
+    objects = []
+    for name in sorted(set(names)):
+        source = Path(weave) / OBJECT_DIR / name / f"{name}.obj"
+        primitives = source.with_suffix(".usda")
+        part_dir = output / "parts" / name
+        parts = primitive_parts(primitives, part_dir) if primitives.is_file() else cooked_parts(name, part_dir)
+        visual = output / "visual" / f"{name}.obj"
+        visual.parent.mkdir(exist_ok=True)
+        shutil.copyfile(source, visual)
+        meshes = [trimesh.load(p, force="mesh") for p in parts]
+        mass = float(DENSITY.get(name, DEFAULT_DENSITY) * np.array([abs(m.volume) for m in meshes]).sum())
+        com, inertia = uniform_density_inertial(meshes, mass)
+        objects.append(dict(name=name, parts=parts, visual=visual, mass=mass, com=com, inertia=inertia))
+    return write_objects(output, objects)

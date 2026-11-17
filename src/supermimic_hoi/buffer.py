@@ -10,15 +10,12 @@ FIELDS = ("s", "s1", "f", "age", "prev_action", "hand", "u", "context", "finger_
 class Replay:
     """Ring buffer of (steps, num_envs) transitions.
 
-    Every clip owns a contiguous, equally sized block of worlds. Sampling first draws a clip
-    uniformly and then a transition of that clip, so a hard clip whose episodes end early keeps
-    the same weight as an easy one.
+    Sampling is uniform over the valid transitions. Collection gives every clip the same share of
+    simulated time, so a hard clip whose episodes end early keeps the same weight as an easy one.
     """
 
-    def __init__(self, steps: int, num_envs: int, num_clips: int, device: str):
-        if num_envs % num_clips:
-            raise ValueError("Replay needs the same number of worlds for every clip")
-        self.T, self.N, self.clips, self.device = steps, num_envs, num_clips, device
+    def __init__(self, steps: int, num_envs: int, device: str):
+        self.T, self.N, self.device = steps, num_envs, device
         self.data, self.size, self.ptr = {}, 0, 0
 
     def add(self, row: dict):
@@ -34,32 +31,27 @@ class Replay:
         return (self.ptr - self.size + age) % self.T
 
     def sample(self, batch: int, length: int):
-        """(age, env) of ``batch`` valid transitions among the oldest ``length`` steps, clips drawn uniformly."""
+        """(age, env) of ``batch`` valid transitions among the oldest ``length`` steps."""
         if length < 1:
             raise ValueError("Cannot sample an empty replay")
-        width = self.N // self.clips
-        clips = torch.randint(self.clips, (batch,), device=self.device)
         age = torch.zeros(batch, dtype=torch.long, device=self.device)
-        env = clips * width
+        env = torch.zeros(batch, dtype=torch.long, device=self.device)
         accepted = torch.zeros(batch, dtype=torch.bool, device=self.device)
         for _ in range(8):
             proposed_age = torch.randint(length, (batch,), device=self.device)
-            proposed_env = clips * width + torch.randint(width, (batch,), device=self.device)
+            proposed_env = torch.randint(self.N, (batch,), device=self.device)
             take = ~accepted & self.data["valid"][self.row(proposed_age), proposed_env]
             age, env = torch.where(take, proposed_age, age), torch.where(take, proposed_env, env)
             accepted |= take
             if bool(accepted.all()):
                 return age, env
-        # Rare: enumerate the valid transitions of each remaining clip instead of switching clips.
-        ages = torch.arange(length, device=self.device)
-        for clip in clips[~accepted].unique().tolist():
-            envs = torch.arange(clip * width, (clip + 1) * width, device=self.device)
-            available = self.data["valid"][self.row(ages)[:, None], envs[None, :]].nonzero()
-            if not available.numel():
-                raise ValueError(f"Replay has no valid transition for clip {clip}")
-            ids = ((clips == clip) & ~accepted).nonzero().flatten()
-            chosen = available[torch.randint(len(available), (len(ids),), device=self.device)]
-            age[ids], env[ids] = chosen[:, 0], envs[chosen[:, 1]]
+        # Rare: draw the rest among the valid transitions, listed explicitly.
+        available = self.data["valid"][self.row(torch.arange(length, device=self.device))].nonzero()
+        if not available.numel():
+            raise ValueError("Replay has no valid transition")
+        ids = (~accepted).nonzero().flatten()
+        chosen = available[torch.randint(len(available), (len(ids),), device=self.device)]
+        age[ids], env[ids] = chosen[:, 0], chosen[:, 1]
         return age, env
 
     def windows(self, batch: int, k: int) -> dict:

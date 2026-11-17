@@ -12,7 +12,7 @@ import mujoco
 import numpy as np
 import torch
 
-from .robot import COM_BODY, COM_RANGE, FRICTION_RANGE, JOINT_OFFSET, Robot
+from .robot import COM_RANGE, FRICTION_RANGE, JOINT_OFFSET, Robot
 
 OBJECT_CONTEXT = 13  # mass, CoM, inertia, friction (see prepare.objects.CONTEXT_FIELDS)
 
@@ -61,7 +61,7 @@ class Randomizer:
             self.xi[:, self.layout.friction] = torch.empty(N, 1, device=device).uniform_(*FRICTION_RANGE)
             com = torch.stack([torch.empty(N, device=device).uniform_(lo, hi) for lo, hi in COM_RANGE], -1)
             self.xi[:, self.layout.com] = com
-            torso = model.body("robot/" + COM_BODY).id
+            torso = model.body("robot/" + robot.com_body).id
             default = sim.get_default_field("body_ipos")
             default = default[:, torso] if default.ndim == 3 else default[torso]
             sim.model.body_ipos[:, torso] = default + com

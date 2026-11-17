@@ -17,23 +17,22 @@ import mujoco
 import numpy as np
 import torch
 
-from .robot import hand_side
 from .sim import Indexing, encode, make_scene
 
 # Kinds of collision pair, in the column order of the depth table.
 OVERLAP_KINDS = ("hand_object", "robot_ground", "other")
 
 
-def overlap_kind(model: mujoco.MjModel) -> np.ndarray:
+def overlap_kind(model: mujoco.MjModel, robot) -> np.ndarray:
     """(ngeom, ngeom) column of OVERLAP_KINDS for every geom pair of a compiled scene."""
     body = [model.body(b).name for b in model.geom_bodyid]
     ground = model.geom_type == mujoco.mjtGeom.mjGEOM_PLANE
-    robot = np.array([name.startswith("robot/") for name in body])
-    hand = np.array([hand_side(name.removeprefix("robot/")) >= 0 for name in body]) & robot
+    on_robot = np.array([name.startswith("robot/") for name in body])
+    hand = np.array([robot.hand_link(name.removeprefix("robot/"))[0] >= 0 for name in body]) & on_robot
     obj = np.array([name.startswith("object/") for name in body])
     kind = np.full((model.ngeom, model.ngeom), OVERLAP_KINDS.index("other"))
     kind[np.ix_(hand, obj)] = OVERLAP_KINDS.index("hand_object")
-    kind[np.ix_(robot, ground)] = OVERLAP_KINDS.index("robot_ground")
+    kind[np.ix_(on_robot, ground)] = OVERLAP_KINDS.index("robot_ground")
     return np.minimum(kind, kind.T)  # either geom order; "other" is the last column
 
 
@@ -43,7 +42,7 @@ def reference_depths(motion, robot, registry, folder, threads: int = 16) -> torc
     models = {}
     for k in sorted(set(motion.clip_object.tolist())):
         model = make_scene(robot, registry, folder, [k], 1, "cpu").compile()
-        models[k] = (model, overlap_kind(model))
+        models[k] = (model, overlap_kind(model, robot))
 
     def clip_depths(clip: int) -> np.ndarray:
         model, kind = models[int(motion.clip_object[clip])]

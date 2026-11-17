@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from .kinematics import Kinematics
-from .robot import FINGERTIPS, FOOT_BODIES, TRACKED_BODIES, Robot, finger_channel
+from .robot import Robot
 from .rotations import angular_velocity, central_difference, mat_to_6d, mm3, mv3, quat_to_mat, yaw_mat
 
 CONTROL_DT = 0.02
@@ -84,9 +84,9 @@ class Motion:
 
         # Tracked bodies come first, then the fingertips; rotations and velocities are only
         # needed for the tracked bodies.
-        self.num_tracked = len(TRACKED_BODIES)
-        self.tips = list(range(self.num_tracked, self.num_tracked + len(FINGERTIPS)))
-        self.feet = [TRACKED_BODIES.index(n) for n in FOOT_BODIES]
+        self.num_tracked = len(robot.tracked_bodies)
+        self.tips = list(range(self.num_tracked, self.num_tracked + len(robot.fingertips)))
+        self.feet = [robot.tracked_bodies.index(n) for n in robot.foot_bodies]
         parts = [[], [], [], []]
         with torch.no_grad():
             for chunk in torch.arange(self.num_frames, device=device).split(65536):
@@ -98,7 +98,7 @@ class Motion:
 
         Rt = self.root_R.transpose(-1, -2)
         self.root_v_local, self.root_w_local = mv3(Rt, self.root_v), mv3(Rt, self.root_w)
-        channels = torch.tensor([finger_channel(b) for b in label_bodies])
+        channels = torch.tensor([robot.hand_link(b)[1] for b in label_bodies])
         touching = arrays["contact_label"] > 0
         self.finger_intent = to(torch.stack([touching[:, channels == c].any(-1) for c in range(10)], -1).float())
         self.onehot = torch.eye(len(self.object_names), device=device)

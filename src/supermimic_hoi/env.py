@@ -14,6 +14,7 @@ from .motion import Motion
 from .randomization import ContextLayout, Randomizer
 from .reset_guard import build_reset_guard
 from .robot import Robot
+from .robots import load_robot
 from .sim import CPUPhysics, WarpPhysics, load_registry, robot_signature
 from .state import pack
 
@@ -21,22 +22,22 @@ from .state import pack
 class HOIEnv:
     """Fixed-shape vector environment.
 
-    Each world is bound to one clip (and therefore one object) for the whole run. Robot and object
-    are always reset together to the same reference frame, with reference velocities; there is no
-    independent pose jitter, which would break the contact geometry. All per-world tensors are
-    updated in place, so a control step and its resets can be captured in a CUDA graph.
+    A world is not tied to a clip: every reset draws one and the world takes that clip's object, so
+    the number of worlds is independent of the number of clips. The clip that has had the least
+    simulated time is the most likely to be drawn, which gives every clip the same share of time
+    however long its episodes last. Robot and object are always reset together to the same
+    reference frame, with reference velocities; there is no independent pose jitter, which would
+    break the contact geometry. All per-world tensors are updated in place, so a control step and
+    its resets can be captured in a CUDA graph.
     """
 
     def __init__(self, motion: Motion, controller: Controller, mdp: HOIMDP, robot: Robot, registry: dict, cfg):
         self.motion, self.controller, self.mdp, self.cfg = motion, controller, mdp, cfg
         self.device, self.N = cfg.device, cfg.num_envs
-        clips = len(motion.names)
-        if self.N % clips:
-            raise ValueError(f"num_envs must be a multiple of the number of clips ({clips})")
-        self.env_clip = torch.arange(clips, device=self.device).repeat_interleave(self.N // clips)
-        assignment = motion.clip_object[self.env_clip].tolist()
         backend = CPUPhysics if cfg.backend == "cpu" else WarpPhysics
-        self.physics = backend(robot, registry, cfg.object_assets, assignment, cfg)
+        self.physics = backend(robot, registry, cfg.object_assets, sorted(set(motion.clip_object.tolist())), self.N, cfg)
+        # Simulated steps every clip has received, counted from the least served clip.
+        self.clip_steps = torch.zeros(len(motion.names), device=self.device)
         self.randomizer = Randomizer(robot, self.physics, mdp.layout, cfg.randomize)
         self.reset_map, self.reset_depths, self.reset_summary = build_reset_guard(
             motion, robot, registry, cfg.object_assets, cfg.reset_overlap_tolerance)
@@ -57,11 +58,14 @@ class HOIEnv:
         self.history = self.observe()[:, None].repeat(1, cfg.history, 1)
 
     def sample_frames(self):
-        """Episode starts: frame zero, shortly before a contact phase, or uniform over the clip;
-        each then moved to the nearest frame that passes the penetration screen."""
-        c, m, clips = self.cfg, self.motion, self.env_clip
-        start, end = m.clip_start[clips], m.clip_end[clips]
+        """Episode starts. The clip: drawn in proportion to how far each clip is behind the most served
+        one. The frame: frame zero, shortly before a contact phase, or uniform over the clip; then
+        moved to the nearest frame that passes the penetration screen."""
+        c, m = self.cfg, self.motion
         uniform = lambda: torch.rand(self.N, device=self.device)  # noqa: E731
+        edges = (self.clip_steps.max() - self.clip_steps + 1).cumsum(0)
+        clips = torch.searchsorted(edges, uniform() * edges[-1], right=True).clamp(max=len(edges) - 1)
+        start, end = m.clip_start[clips], m.clip_end[clips]
         frames = start + (uniform() * (end - start)).long()
         draw = uniform()
         choice = (uniform() * self.pregrasp_count[clips]).long()
@@ -74,8 +78,8 @@ class HOIEnv:
         frames = self.sample_frames() if frames is None else frames
         state = self.motion.ref_state(frames)
         self.randomizer.resample(mask)
+        self.physics.reset(mask, state, self.motion.clip_object[self.motion.clip_id[frames]])
         self.context.copy_(torch.where(mask[:, None], self.randomizer.context(), self.context))
-        self.physics.reset(mask, state)
         self.f.copy_(torch.where(mask, frames, self.f))
         for value in (self.age, self.episode_return, self.previous_action):
             value.masked_fill_(mask.reshape(-1, *([1] * (value.ndim - 1))), 0)
@@ -129,6 +133,8 @@ class HOIEnv:
                    u=c.effective(target), context=context, contact=contact, finger_score=scores,
                    o=self.history[:, -1].clone(), cut=done, term=failure, clip_end=clip_end, valid=valid,
                    reward=reward, terms=terms, reasons=reasons, episode_return=self.episode_return.clone())  # fmt: skip
+        self.clip_steps.index_add_(0, m.clip_id[f], torch.ones_like(reward))
+        self.clip_steps.sub_(self.clip_steps.min())
         self.f.copy_(f1)
         self.age.add_(1)
         self.previous_action.copy_(action)
@@ -149,7 +155,7 @@ class Task:
 
 
 def make_task(cfg) -> Task:
-    robot = Robot(cfg.robot_assets)
+    robot = load_robot(cfg.robot_assets)
     registry, object_signature = load_registry(cfg.object_assets)
     motion = Motion(cfg.dataset, robot, [o["name"] for o in registry["objects"]], cfg.device, cfg.clips)
     if cfg.device.startswith("cuda"):

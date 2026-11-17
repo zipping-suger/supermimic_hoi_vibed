@@ -6,7 +6,7 @@
 import argparse
 from pathlib import Path
 
-from ..robot import Robot
+from ..robots import load_robot
 from .dataset import prepare_dataset
 from .objects import prepare_objects
 from .robot import prepare_robot
@@ -23,7 +23,7 @@ def main():
     a = p.parse_args()
 
     prepare_robot(a.weave, a.output / "robot")
-    robot = Robot(a.output / "robot")
+    robot = load_robot(a.output / "robot")
     print(f"Robot: {robot.num_joints} joints, {robot.num_actions} actions, {robot.model.body_mass.sum():.2f} kg")
     manifest = prepare_dataset(a.weave, a.output / (a.name or f"weave{a.clips}"), robot, a.split, a.clips, a.seed)
     print(f"Dataset: {manifest['clips']} clips, {manifest['frames']} frames ({manifest['hours']:.2f} h), "

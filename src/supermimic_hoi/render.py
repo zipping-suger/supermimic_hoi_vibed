@@ -20,7 +20,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from .motion import CONTROL_DT, Motion  # noqa: E402
-from .robot import Robot  # noqa: E402
+from .robots import load_robot  # noqa: E402
 from .sim import Indexing, encode, load_registry, make_scene  # noqa: E402
 from .state import unpack  # noqa: E402
 
@@ -37,7 +37,7 @@ def to_qpos(states, model, idx) -> np.ndarray:
 def render(clip: str, output: Path, rollout: Path | None, dataset: str, robot_assets: str, object_assets: str, fps: int = 25):
     import imageio_ffmpeg
 
-    robot = Robot(Path(robot_assets))
+    robot = load_robot(robot_assets)
     registry, _ = load_registry(object_assets)
     motion = Motion(dataset, robot, [o["name"] for o in registry["objects"]], clips=[clip])
     model = make_scene(robot, registry, object_assets, [int(motion.clip_object[0])], 1, "cpu").compile()
@@ -55,7 +55,7 @@ def render(clip: str, output: Path, rollout: Path | None, dataset: str, robot_as
     data = mujoco.MjData(model)
     camera = mujoco.MjvCamera()
     camera.azimuth, camera.elevation, camera.distance = 135, -15, 3.2
-    pelvis = model.body("robot/pelvis").id
+    root = model.body("robot/" + robot.tracked_bodies[0]).id
     step = max(1, round(1 / (fps * CONTROL_DT)))
     output.parent.mkdir(parents=True, exist_ok=True)
     writer = imageio_ffmpeg.write_frames(str(output), (WIDTH * len(panels), HEIGHT), fps=fps, macro_block_size=1)
@@ -67,7 +67,7 @@ def render(clip: str, output: Path, rollout: Path | None, dataset: str, robot_as
                 data.qpos[:] = qpos[t]
                 mujoco.mj_forward(model, data)
                 if not images:
-                    camera.lookat[:] = (data.xpos[pelvis][0], data.xpos[pelvis][1], 0.7)
+                    camera.lookat[:] = (data.xpos[root][0], data.xpos[root][1], robot.root_height - 0.06)
                 renderer.update_scene(data, camera=camera)
                 images.append(renderer.render().copy())
             writer.send(np.ascontiguousarray(np.concatenate(images[::-1], axis=1)))

@@ -1,6 +1,7 @@
 import re
 
 import numpy as np
+import pytest
 
 from supermimic_hoi.prepare.dataset import ROLLOUT_SUFFIX, prepare_dataset, select_clips
 from supermimic_hoi.prepare.objects import (MAX_HULL_VERTICES, WEAVE_HULLS, cooked_parts, primitive_parts, primitive_vertices,
@@ -82,6 +83,7 @@ def test_cooked_parts_are_the_exported_weave_hulls(tmp_path):
         cooked_parts("clothesstand", tmp_path / "clothesstand")  # primitive colliders, not in the archive
 
 
+@pytest.mark.parametrize("assets", ["g1_inspire"], indirect=True)
 def test_rollout_archives_are_sampled_under_their_reference_clip_names(robot, tmp_path):
     """A Weave rollout archive is a reference archive whose clip names carry ROLLOUT_SUFFIX."""
     from supermimic_hoi.kinematics import Kinematics
